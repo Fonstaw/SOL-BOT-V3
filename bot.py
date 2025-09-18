@@ -13,7 +13,6 @@ from telethon.sessions import StringSession
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 from solana.rpc.api import Client
-from solders.pubkey import PublicKey
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solana.transaction import Transaction
@@ -89,7 +88,7 @@ def get_token_decimals(mint: str) -> int:
     Falls back to 6 if it cannot fetch.
     """
     try:
-        mint_pubkey = PublicKey(mint)
+        mint_pubkey = Pubkey.from_string(mint)
         token = Token(sol_client, mint_pubkey, TOKEN_PROGRAM_ID, payer)
         decimals = token.get_mint_info().decimals
         logger.info(f"Decimals for {mint}: {decimals}")
