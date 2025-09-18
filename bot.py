@@ -127,9 +127,16 @@ def get_swap_quote(input_mint, output_mint, amount):
         "onlyDirectRoutes": False,
     }
 
-    r = requests.get(url, params=params)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = requests.get(url, params=params)
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP error fetching swap quote for {input_mint} to {output_mint}: {e}, status={r.status_code}, response={r.text}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error fetching swap quote for {input_mint} to {output_mint}: {e}")
+        return None
 
 def execute_swap_route(route, output_mint, expected_out_amount):
     try:
@@ -186,36 +193,39 @@ async def buy_token(token_mint):
     try:
         logger.info(f"Fetching swap quote for {token_mint} with {TRADE_AMOUNT_USDC} USDC")
         quote = get_swap_quote(USDC_MINT, token_mint, TRADE_AMOUNT_USDC)
-        if quote and quote.get("data"):
-            route = quote["data"][0]
-            logger.info(f"Got swap quote: {route}")
-            logger.info(f"Executing swap for {token_mint}")
-            expected_out_amount = int(route["outAmount"])
-            resp = execute_swap_route(route, token_mint, expected_out_amount)
-            if resp:
-                logger.info(f"Swap successful for {token_mint}, fetching price")
-                buy_price = fetch_token_price(token_mint)
+        if not quote:
+            logger.error(f"No swap quote returned for {token_mint}. Skipping buy.")
+            return
+        if not quote.get("data"):
+            logger.error(f"No valid swap quote data for {token_mint}: {quote}")
+            return
+        route = quote["data"][0]
+        logger.info(f"Got swap quote: {route}")
+        logger.info(f"Executing swap for {token_mint}")
+        expected_out_amount = int(route["outAmount"])
+        resp = execute_swap_route(route, token_mint, expected_out_amount)
+        if resp:
+            logger.info(f"Swap successful for {token_mint}, fetching price")
+            buy_price = fetch_token_price(token_mint)
 
-                # NEW: how many tokens did we actually receive?
-                out_amount_base = int(route["outAmount"])  # base units returned by Jupiter
-                token_decimals = get_token_decimals(token_mint)  # your decimals helper
-                out_amount_human = out_amount_base / (10 ** token_decimals)
+            # NEW: how many tokens did we actually receive?
+            out_amount_base = int(route["outAmount"])  # base units returned by Jupiter
+            token_decimals = get_token_decimals(token_mint)  # your decimals helper
+            out_amount_human = out_amount_base / (10 ** token_decimals)
 
-                trades[token_mint] = {
-                    "buy_price": buy_price,          # price in USDC
-                    "amount": out_amount_human,      # store token quantity you now hold
-                    "targets": PRESET_SELL_TARGETS.copy(),
-                    "stop_loss": PRESET_STOP_LOSS[2],  # Default to 30%
-                }
-                save_trades(trades)
-                logger.info(
-                    f"Bought {out_amount_human} of {token_mint} at {buy_price} USDC "
-                    f"with targets {trades[token_mint]['targets']} and stop-loss {trades[token_mint]['stop_loss']}%"
-                )
-            else:
-                logger.error(f"Swap execution returned None for {token_mint}")
+            trades[token_mint] = {
+                "buy_price": buy_price,          # price in USDC
+                "amount": out_amount_human,      # store token quantity you now hold
+                "targets": PRESET_SELL_TARGETS.copy(),
+                "stop_loss": PRESET_STOP_LOSS[2],  # Default to 30%
+            }
+            save_trades(trades)
+            logger.info(
+                f"Bought {out_amount_human} of {token_mint} at {buy_price} USDC "
+                f"with targets {trades[token_mint]['targets']} and stop-loss {trades[token_mint]['stop_loss']}%"
+            )
         else:
-            logger.error(f"No valid swap quote for {token_mint}: {quote}")
+            logger.error(f"Swap execution returned None for {token_mint}")
     except Exception as e:
         logger.error(f"Buy failed for {token_mint}: {str(e)}")
 
