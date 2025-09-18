@@ -13,7 +13,7 @@ from telethon.sessions import StringSession
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 from solana.rpc.api import Client
-from solana.publickey import PublicKey
+from solders.pubkey import PublicKey
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solana.transaction import Transaction
