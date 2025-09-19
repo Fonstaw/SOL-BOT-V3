@@ -45,7 +45,6 @@ AUTO_SELL_TARGETS = [float(x) for x in os.environ.get("AUTO_SELL_TARGETS", "2,3,
 AUTO_BUY = os.environ.get("AUTO_BUY", "true").lower() == "true"
 TRADE_AMOUNT_USDC = float(os.environ.get("TRADE_AMOUNT_USDC", 0.01))
 SLIPPAGE_BPS = int(os.environ.get("SLIPPAGE_BPS", 100))  # Default 1% (100 basis points)
-MIN_SLIPPAGE_TOLERANCE = float(os.environ.get("MIN_SLIPPAGE_TOLERANCE", 1.0))  # Default 1% for min-receive
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", 3))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
@@ -138,14 +137,17 @@ def get_swap_quote(input_mint, output_mint, amount):
         logger.error(f"Unexpected error fetching swap quote for {input_mint} to {output_mint}: {e}")
         return None
 
-def execute_swap_route(route, output_mint, expected_out_amount):
+def execute_swap_route(route, output_mint):
     try:
-        # Check minimum receive amount
+        # Jupiter provides 'otherAmountThreshold' which accounts for slippageBps.
+        # The on-chain program will use this to ensure you don't receive less than expected.
         out_amount_base = int(route["outAmount"])
-        min_amount_base = int(expected_out_amount * (1 - MIN_SLIPPAGE_TOLERANCE / 100))
-        if out_amount_base < min_amount_base:
-            logger.error(f"Swap rejected: outAmount {out_amount_base} below min {min_amount_base} for {output_mint}")
-            return None
+        min_amount_out = int(route["otherAmountThreshold"])
+        logger.info(
+            f"Executing swap for {output_mint}. "
+            f"Quoted out amount: {out_amount_base}, "
+            f"Minimum to receive (slippage adjusted): {min_amount_out}"
+        )
 
         logger.info("Decoding transaction bytes")
         tx_bytes = base64.b64decode(route["swapTransaction"])
@@ -158,14 +160,18 @@ def execute_swap_route(route, output_mint, expected_out_amount):
 
         # 3. Send transaction and wait for confirmation
         logger.info("Sending signed transaction")
-        resp = sol_client.send_transaction(tx, payer, opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed"))
-
-        sig = resp["result"] if "result" in resp else resp
+        # The response structure from send_transaction can vary. Handle it robustly.
+        resp = sol_client.send_transaction(tx, opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed"))
+        sig = resp.value if hasattr(resp, 'value') else resp.get('result')
+        if not sig:
+            logger.error(f"Failed to extract signature from response: {resp}")
+            return None
+            
         logger.info(f"Transaction signature: {sig}")
 
         # 4. Confirm transaction
         sol_client.confirm_transaction(sig, commitment="confirmed")
-        logger.info(f"Transaction confirmed: {sig}")
+        logger.info(f"Transaction confirmed: https://solscan.io/tx/{sig}")
         return resp
     except Exception as e:
         logger.error(f"Swap execution failed: {str(e)}")
@@ -175,10 +181,11 @@ def execute_swap_route(route, output_mint, expected_out_amount):
 def fetch_token_price(token_mint):
     logger.info(f"Fetching price for token: {token_mint}")
     quote = get_swap_quote(token_mint, USDC_MINT, 1)
-    if quote and quote.get("data"):
-        return quote["data"][0]["outAmount"] / (10 ** get_token_decimals(USDC_MINT))
+    if quote and "data" in quote and quote["data"]:
+        return int(quote["data"][0]["outAmount"]) / (10 ** get_token_decimals(USDC_MINT))
     logger.error(f"No valid price quote for {token_mint}")
     return None
+
 
 # ------------------ TRADE LOGIC ------------------ #
 async def buy_token(token_mint):
@@ -202,8 +209,7 @@ async def buy_token(token_mint):
         route = quote["data"][0]
         logger.info(f"Got swap quote: {route}")
         logger.info(f"Executing swap for {token_mint}")
-        expected_out_amount = int(route["outAmount"])
-        resp = execute_swap_route(route, token_mint, expected_out_amount)
+        resp = execute_swap_route(route, token_mint)
         if resp:
             logger.info(f"Swap successful for {token_mint}, fetching price")
             buy_price = fetch_token_price(token_mint)
@@ -232,41 +238,60 @@ async def buy_token(token_mint):
 async def check_auto_sell():
     global trades
     to_remove = []
-    for token, info in trades.items():
+    # Create a copy of items to avoid issues with modifying the dictionary during iteration
+    for token, info in list(trades.items()):
         try:
             current_price = fetch_token_price(token)
             if current_price is None:
                 continue
+            
+            # Check for take-profit targets
             for target in info["targets"]:
                 if current_price >= info["buy_price"] * target:
+                    logger.info(f"Take-profit target {target}x hit for {token}. Attempting to sell.")
                     quote = get_swap_quote(token, USDC_MINT, info["amount"])
+                    if not quote or not quote.get("data"):
+                        logger.error(f"Could not get sell quote for {token}")
+                        continue
                     route = quote["data"][0]
-                    expected_out_amount = int(route["outAmount"])
-                    resp = execute_swap_route(route, USDC_MINT, expected_out_amount)
+                    resp = execute_swap_route(route, USDC_MINT)
                     if resp:
                         out_amount_base = int(route["outAmount"])
                         usdc_decimals = get_token_decimals(USDC_MINT)
                         out_amount_human = out_amount_base / (10 ** usdc_decimals)
                         logger.info(f"Sold {info['amount']} of {token} for {out_amount_human} USDC at {current_price} (target {target}x)")
                         to_remove.append(token)
-                    break
-                if current_price <= info["buy_price"] * (1 - info["stop_loss"] / 100):
-                    quote = get_swap_quote(token, USDC_MINT, info["amount"])
-                    route = quote["data"][0]
-                    expected_out_amount = int(route["outAmount"])
-                    resp = execute_swap_route(route, USDC_MINT, expected_out_amount)
-                    if resp:
-                        out_amount_base = int(route["outAmount"])
-                        usdc_decimals = get_token_decimals(USDC_MINT)
-                        out_amount_human = out_amount_base / (10 ** usdc_decimals)
-                        logger.info(f"Sold {info['amount']} of {token} for {out_amount_human} USDC at {current_price} (stop-loss {info['stop_loss']}%)")
-                        to_remove.append(token)
-                    break
+                        break  # Exit the inner loop once sold
+            
+            if token in to_remove: # If sold based on target, skip stop-loss check
+                continue
+
+            # Check for stop-loss
+            stop_loss_price = info["buy_price"] * (1 - info["stop_loss"] / 100)
+            if current_price <= stop_loss_price:
+                logger.info(f"Stop-loss of {info['stop_loss']}% hit for {token}. Attempting to sell.")
+                quote = get_swap_quote(token, USDC_MINT, info["amount"])
+                if not quote or not quote.get("data"):
+                    logger.error(f"Could not get sell quote for {token} (stop-loss)")
+                    continue
+                route = quote["data"][0]
+                resp = execute_swap_route(route, USDC_MINT)
+                if resp:
+                    out_amount_base = int(route["outAmount"])
+                    usdc_decimals = get_token_decimals(USDC_MINT)
+                    out_amount_human = out_amount_base / (10 ** usdc_decimals)
+                    logger.info(f"Sold {info['amount']} of {token} for {out_amount_human} USDC at {current_price} (stop-loss {info['stop_loss']}%)")
+                    to_remove.append(token)
+
         except Exception as e:
             logger.error(f"Auto-sell error for {token}: {e}")
-    for token in to_remove:
-        trades.pop(token)
-    save_trades(trades)
+            
+    if to_remove:
+        for token in to_remove:
+            if token in trades:
+                trades.pop(token)
+        save_trades(trades)
+
 
 async def auto_sell_loop():
     logger.info("Starting auto-sell loop")
@@ -277,7 +302,7 @@ async def auto_sell_loop():
 # ------------------ TELEGRAM COMMANDS ------------------ #
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received /status command")
-    msg = f"Auto-buy: {AUTO_BUY}\nTrade amount: {TRADE_AMOUNT_USDC} USDC\nSlippage: {SLIPPAGE_BPS/100}%\nMin Slippage Tolerance: {MIN_SLIPPAGE_TOLERANCE}%\nChannels: {CHANNELS}\nPreset Sell Targets: {PRESET_SELL_TARGETS}\nPreset Stop-Loss: {[f'{x}%' for x in PRESET_STOP_LOSS]}\n\nTracked Tokens:\n"
+    msg = f"Auto-buy: {AUTO_BUY}\nTrade amount: {TRADE_AMOUNT_USDC} USDC\nSlippage: {SLIPPAGE_BPS/100}%\nChannels: {CHANNELS}\nPreset Sell Targets: {PRESET_SELL_TARGETS}\nPreset Stop-Loss: {[f'{x}%' for x in PRESET_STOP_LOSS]}\n\nTracked Tokens:\n"
     for token, info in trades.items():
         msg += f"{token}: Buy {info['amount']} tokens at {info['buy_price']}, Targets {info['targets']}, Stop-loss {info['stop_loss']}%\n"
     keyboard = [
@@ -315,7 +340,7 @@ async def setamount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         TRADE_AMOUNT_USDC = float(context.args[0])
         await update.message.reply_text(f"Trade amount updated to {TRADE_AMOUNT_USDC} USDC")
-    except:
+    except (IndexError, ValueError):
         await update.message.reply_text("Usage: /setamount <amount>")
 
 async def settargets(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -329,7 +354,7 @@ async def settargets(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Targets for {token} updated: {targets}")
         else:
             await update.message.reply_text(f"{token} not tracked yet")
-    except:
+    except (IndexError, ValueError):
         await update.message.reply_text("Usage: /settargets <token> <x1,x2,...>")
 
 async def setstoploss(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -337,13 +362,16 @@ async def setstoploss(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         token = context.args[0]
         stop = float(context.args[1])
-        if 0 < stop <= 100:
-            trades[token]["stop_loss"] = stop
-            save_trades(trades)
-            await update.message.reply_text(f"Stop-loss for {token} updated: {stop}%")
+        if token in trades:
+            if 0 < stop <= 100:
+                trades[token]["stop_loss"] = stop
+                save_trades(trades)
+                await update.message.reply_text(f"Stop-loss for {token} updated: {stop}%")
+            else:
+                await update.message.reply_text("Stop-loss percentage must be between 0 and 100.")
         else:
             await update.message.reply_text(f"{token} not tracked yet")
-    except:
+    except (IndexError, ValueError):
         await update.message.reply_text("Usage: /setstoploss <token> <percentage>")
 
 async def togglebuy(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -361,7 +389,7 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Channel added: {channel}")
         else:
             await update.message.reply_text("Channel already exists")
-    except:
+    except IndexError:
         await update.message.reply_text("Usage: /addchannel @channel")
 
 async def removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -373,7 +401,7 @@ async def removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Channel removed: {channel}")
         else:
             await update.message.reply_text("Channel not found")
-    except:
+    except IndexError:
         await update.message.reply_text("Usage: /removechannel @channel")
 
 async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -382,16 +410,19 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token = context.args[0]
         if token in trades:
             quote = get_swap_quote(token, USDC_MINT, trades[token]["amount"])
+            if not quote or not quote.get("data"):
+                await update.message.reply_text(f"Could not get a quote to sell {token}")
+                return
             route = quote["data"][0]
-            expected_out_amount = int(route["outAmount"])
-            resp = execute_swap_route(route, USDC_MINT, expected_out_amount)
+            resp = execute_swap_route(route, USDC_MINT)
             if resp:
                 out_amount_base = int(route["outAmount"])
                 usdc_decimals = get_token_decimals(USDC_MINT)
                 out_amount_human = out_amount_base / (10 ** usdc_decimals)
+                amount_sold = trades[token]['amount']
                 trades.pop(token)
                 save_trades(trades)
-                await update.message.reply_text(f"Manually sold {trades[token]['amount']} of {token} for {out_amount_human} USDC")
+                await update.message.reply_text(f"Manually sold {amount_sold} of {token} for {out_amount_human} USDC")
             else:
                 await update.message.reply_text(f"Failed to sell {token}: Swap rejected or failed")
         else:
@@ -412,16 +443,15 @@ async def setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setslippage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received /setslippage command")
-    global SLIPPAGE_BPS, MIN_SLIPPAGE_TOLERANCE
+    global SLIPPAGE_BPS
     try:
         slippage_percent = float(context.args[0])
-        if 0.1 <= slippage_percent <= 10:
+        if 0.1 <= slippage_percent <= 50: # Increased max slippage
             SLIPPAGE_BPS = int(slippage_percent * 100)
-            MIN_SLIPPAGE_TOLERANCE = slippage_percent  # Sync with SLIPPAGE_BPS
-            await update.message.reply_text(f"Slippage and min slippage tolerance updated to {slippage_percent}% ({SLIPPAGE_BPS} bps)")
+            await update.message.reply_text(f"Slippage updated to {slippage_percent}% ({SLIPPAGE_BPS} bps)")
         else:
-            await update.message.reply_text("Slippage must be between 0.1% and 10%")
-    except:
+            await update.message.reply_text("Slippage must be between 0.1% and 50%")
+    except (IndexError, ValueError):
         await update.message.reply_text("Usage: /setslippage <percentage>")
 
 async def setpresettargets(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -434,7 +464,7 @@ async def setpresettargets(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Preset sell targets updated: {PRESET_SELL_TARGETS}")
         else:
             await update.message.reply_text("Targets must be >= 1")
-    except:
+    except (IndexError, ValueError):
         await update.message.reply_text("Usage: /setpresettargets <x1,x2,...>")
 
 async def setpresetstoploss(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -447,13 +477,13 @@ async def setpresetstoploss(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Preset stop-loss updated: {[f'{x}%' for x in PRESET_STOP_LOSS]}")
         else:
             await update.message.reply_text("Stop-loss values must be between 0 and 100%")
-    except:
+    except (IndexError, ValueError):
         await update.message.reply_text("Usage: /setpresetstoploss <x1,x2,...>")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    global AUTO_BUY, SLIPPAGE_BPS, PRESET_SELL_TARGETS, PRESET_STOP_LOSS, MIN_SLIPPAGE_TOLERANCE
+    global AUTO_BUY
     if query.data == "togglebuy":
         AUTO_BUY = not AUTO_BUY
         await query.message.reply_text(f"Auto-buy set to {AUTO_BUY}")
@@ -477,7 +507,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "sell":
         await query.message.reply_text("Send /sell <token> to sell a tracked token")
     elif query.data == "setslippage":
-        await query.message.reply_text("Send /setslippage <percentage> to set slippage (0.1 to 10)")
+        await query.message.reply_text("Send /setslippage <percentage> to set slippage (0.1 to 50)")
     elif query.data == "setpresettargets":
         await query.message.reply_text("Send /setpresettargets <x1,x2,...> to set preset sell targets")
     elif query.data == "setpresetstoploss":
@@ -506,21 +536,22 @@ async def new_message(event):
     if not event.chat:
         logger.debug("Received message from unknown chat, skipping")
         return
-    chat_username = (event.chat.username or "").lower()
+    chat_username = (getattr(event.chat, 'username', None) or "").lower()
     for channel in CHANNELS:
         env_channel = channel.lower().strip().lstrip("@")
         if chat_username == env_channel:
             logger.info(f"Message detected in channel {env_channel}: {msg}")
-            token_pattern = r"[1-9A-HJ-NP-Za-km-z]{44}"
+            # A more robust regex for Solana addresses
+            token_pattern = r'\b([1-9A-HJ-NP-Za-km-z]{32,44})\b'
             tokens = re.findall(token_pattern, msg)
             for token in tokens:
-                try:
-                    base58_chars = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-                    if len(token) == 44 and all(c in base58_chars for c in token):
-                        logger.info(f"Detected token {token} in {env_channel}")
-                        await buy_token(token)
-                except Exception as e:
-                    logger.error(f"Error with token {token}: {e}")
+                # Basic validation for Base58 characters and length
+                if 32 <= len(token) <= 44 and all(c in "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz" for c in token):
+                    logger.info(f"Detected token {token} in {env_channel}")
+                    await buy_token(token)
+                else:
+                    logger.debug(f"Filtered out invalid potential token: {token}")
+
 
 # ------------------ MAIN EXECUTION ------------------ #
 def run_flask():
@@ -542,11 +573,11 @@ if __name__ == "__main__":
     logger.info("Starting bot")
     required_envs = [
         "API_ID", "API_HASH", "SESSION_STRING", "BOT_TOKEN",
-        "SOLANA_PRIVATE_KEY", "SOLANA_RPC", "JUPITER_API", "USDC_MINT"
+        "SOLANA_PRIVATE_KEY"
     ]
     for env in required_envs:
         if not os.environ.get(env):
-            logger.error(f"Missing env: {env}")
+            logger.error(f"Missing required environment variable: {env}")
             exit(1)
 
     # Start Telethon client
