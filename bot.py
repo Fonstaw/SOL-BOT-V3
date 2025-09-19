@@ -1,6 +1,7 @@
 from solders.transaction import VersionedTransaction
+from solders.message import to_bytes_versioned
+from solders.signature import Signature
 from solana.rpc.types import TxOpts
-from solders.message import MessageV0
 import os
 import json
 import asyncio
@@ -151,29 +152,27 @@ def execute_swap_route(route, output_mint):
         logger.info("Decoding transaction bytes")
         tx_bytes = base64.b64decode(tx_base64)
         
-        original_tx = VersionedTransaction.from_bytes(tx_bytes)
-        
-        logger.info("Fetching latest blockhash...")
-        latest_blockhash_res = sol_client.get_latest_blockhash()
-        blockhash = latest_blockhash_res.value.blockhash
+        # This is the raw, unsigned transaction from Jupiter
+        raw_tx = VersionedTransaction.from_bytes(tx_bytes)
 
-        # --- THE DEFINITIVE FIX: ---
-        # Rebuild the message using the most basic, stable constructor: MessageV0(...)
-        # This avoids all version-specific helper function names.
-        rebuilt_message = MessageV0(
-            payer_key=original_tx.message.account_keys[0],
-            instructions=original_tx.message.instructions,
-            address_lookup_tables=original_tx.message.address_lookup_tables,
-            recent_blockhash=blockhash
-        )
+        # --- THE CORRECT SIGNING AND SENDING WORKFLOW ---
 
-        # Create a new, complete but unsigned transaction
-        rebuilt_tx = VersionedTransaction(rebuilt_message, [])
+        # 1. Get the canonical message bytes to sign
+        message_to_sign = to_bytes_versioned(raw_tx.message)
 
-        logger.info(f"Sending rebuilt transaction with blockhash: {blockhash}")
-        # Let the modern library handle signing and sending
-        transaction_options = TxOpts(skip_preflight=False, preflight_commitment="confirmed")
-        resp = sol_client.send_transaction(rebuilt_tx, payer, opts=transaction_options)
+        # 2. Sign the message bytes with your keypair to create a signature
+        signature = payer.sign_message(message_to_sign)
+
+        # 3. Create a new, signed transaction by populating the raw transaction with the signature
+        signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
+
+        # 4. Serialize the signed transaction to send as a raw blob
+        serialized_tx = bytes(signed_tx)
+
+        logger.info("Sending signed raw transaction")
+        # 5. Send as a raw transaction for maximum compatibility
+        opts = TxOpts(skip_preflight=False, preflight_commitment="confirmed")
+        resp = sol_client.send_raw_transaction(serialized_tx, opts=opts)
         
         sig = resp.value
         
