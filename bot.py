@@ -153,12 +153,11 @@ def execute_swap_route(route, output_mint):
         tx = VersionedTransaction.from_bytes(tx_bytes)
         
         # --- THE FIX: ---
-        # Your library version expects the 'opts' argument BEFORE the 'payer' (signer).
-        # We will now pass them in the correct order.
+        # We simplify the call by removing the 'opts' argument, which is causing conflicts
+        # in your library version. This uses the server's default (and safe) options.
         
         logger.info("Sending signed transaction")
-        transaction_options = TxOpts(skip_preflight=False, preflight_commitment="confirmed")
-        resp = sol_client.send_transaction(tx, transaction_options, payer)
+        resp = sol_client.send_transaction(tx, payer)
         
         sig = resp.value if hasattr(resp, 'value') else resp.get('result')
         
