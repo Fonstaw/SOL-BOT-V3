@@ -157,20 +157,21 @@ def execute_swap_route(route, output_mint):
         latest_blockhash_res = sol_client.get_latest_blockhash()
         blockhash = latest_blockhash_res.value.blockhash
 
-        # --- THE DEFINITIVE FIX BASED ON THE 'payer_key' ERROR ---
-        # 1. Rebuild the message using the fee payer from the correct location: account_keys[0]
-        rebuilt_message = MessageV0.new_with_lookup_tables(
-            payer=original_tx.message.account_keys[0],
+        # --- THE DEFINITIVE FIX: ---
+        # Rebuild the message using the most basic, stable constructor: MessageV0(...)
+        # This avoids all version-specific helper function names.
+        rebuilt_message = MessageV0(
+            payer_key=original_tx.message.account_keys[0],
             instructions=original_tx.message.instructions,
             address_lookup_tables=original_tx.message.address_lookup_tables,
             recent_blockhash=blockhash
         )
 
-        # 2. Create a new, complete but unsigned transaction with an EMPTY signature list
+        # Create a new, complete but unsigned transaction
         rebuilt_tx = VersionedTransaction(rebuilt_message, [])
 
         logger.info(f"Sending rebuilt transaction with blockhash: {blockhash}")
-        # 3. Let the modern library handle signing and sending
+        # Let the modern library handle signing and sending
         transaction_options = TxOpts(skip_preflight=False, preflight_commitment="confirmed")
         resp = sol_client.send_transaction(rebuilt_tx, payer, opts=transaction_options)
         
