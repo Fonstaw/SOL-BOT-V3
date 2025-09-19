@@ -296,7 +296,7 @@ async def auto_sell_loop():
         await check_auto_sell()
         await asyncio.sleep(60)
 
-# ------------------ TELEGRAM COMMANDS (Unchanged) ------------------ #
+# ------------------ TELEGRAM COMMANDS ------------------ #
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received /status command")
     msg = f"Auto-buy: {AUTO_BUY}\nTrade amount: {TRADE_AMOUNT_USDC} USDC\nSlippage: {SLIPPAGE_BPS/100}%\nChannels: {CHANNELS}\nPreset Sell Targets: {PRESET_SELL_TARGETS}\nPreset Stop-Loss: {[f'{x}%' for x in PRESET_STOP_LOSS]}\n\nTracked Tokens:\n"
@@ -501,12 +501,12 @@ app.add_handler(CommandHandler("addchannel", addchannel))
 app.add_handler(CommandHandler("removechannel", removechannel))
 app.add_handler(CommandHandler("sell", sell))
 app.add_handler(CommandHandler("setwallet", setwallet))
-app.add_handler(CommandHandler("set slippage", setslippage))
+app.add_handler(CommandHandler("setslippage", setslippage))
 app.add_handler(CommandHandler("setpresettargets", setpresettargets))
 app.add_handler(CommandHandler("setpresetstoploss", setpresetstoploss))
 app.add_handler(CallbackQueryHandler(button_callback))
 
-# ------------------ TELETHON LISTENER (Unchanged) ------------------ #
+# ------------------ TELETHON LISTENER ------------------ #
 @tele_client.on(events.NewMessage)
 async def new_message(event):
     msg = event.message.message
@@ -527,7 +527,7 @@ async def new_message(event):
                 else:
                     logger.debug(f"Filtered out invalid potential token: {token}")
 
-# ------------------ MAIN EXECUTION (Unchanged) ------------------ #
+# ------------------ MAIN EXECUTION ------------------ #
 def run_flask():
     app_flask.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 
