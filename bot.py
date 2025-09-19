@@ -1,3 +1,5 @@
+from solders.transaction import VersionedTransaction
+from solana.rpc.types import TxOpts
 import os
 import json
 import asyncio
@@ -15,8 +17,6 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Callb
 from solana.rpc.api import Client
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
-from solders.transaction import Transaction
-from solana.rpc.types import TxOpts
 from spl.token.client import Token
 from spl.token.constants import TOKEN_PROGRAM_ID
 
@@ -136,7 +136,6 @@ def execute_swap_route(route, output_mint):
             "quoteResponse": route,
             "userPublicKey": str(payer.pubkey()),
             "wrapAndUnwrapSol": True,
-            "asLegacyTransaction": True,
         }
         swap_resp = requests.post(swap_url, json=swap_payload)
         swap_resp.raise_for_status()
@@ -151,19 +150,23 @@ def execute_swap_route(route, output_mint):
         logger.info("Decoding transaction bytes")
         tx_bytes = base64.b64decode(tx_base64)
         
-        tx = Transaction.from_bytes(tx_bytes)
+        # Create the modern VersionedTransaction object
+        tx = VersionedTransaction.from_bytes(tx_bytes)
         
-        # --- THE FIX: ---
-        # Your library's .sign() method requires the recent_blockhash as a second argument.
-        # We will get it from the transaction object itself and provide it.
-        if tx.recent_blockhash is None:
-            logger.error("FATAL: Transaction from Jupiter is missing a blockhash.")
-            return None
-
-        tx.sign(payer, tx.recent_blockhash)
-
-        logger.info("Sending signed transaction")
-        resp = sol_client.send_transaction(tx)
+        # --- THE CORRECT MODERN WORKFLOW ---
+        # 1. Fetch the latest blockhash from the network.
+        logger.info("Fetching latest blockhash...")
+        latest_blockhash_res = sol_client.get_latest_blockhash()
+        blockhash = latest_blockhash_res.value.blockhash
+        
+        # 2. Add the blockhash to the transaction message. This completes it.
+        tx.message.recent_blockhash = blockhash
+        
+        # 3. Let the modern library handle signing and sending.
+        logger.info(f"Sending transaction with blockhash: {blockhash}")
+        # Pass the completed transaction and the signer. opts must be a keyword argument.
+        transaction_options = TxOpts(skip_preflight=False, preflight_commitment="confirmed", max_retries=3)
+        resp = sol_client.send_transaction(tx, payer, opts=transaction_options)
         
         sig = resp.value if hasattr(resp, 'value') else resp.get('result')
         
@@ -172,6 +175,7 @@ def execute_swap_route(route, output_mint):
             return None
             
         logger.info(f"Transaction signature: {sig}")
+        # We need to get the status of the signature to confirm
         sol_client.confirm_transaction(sig, commitment="confirmed")
         logger.info(f"Transaction confirmed: https://solscan.io/tx/{sig}")
         return resp
@@ -497,7 +501,7 @@ app.add_handler(CommandHandler("addchannel", addchannel))
 app.add_handler(CommandHandler("removechannel", removechannel))
 app.add_handler(CommandHandler("sell", sell))
 app.add_handler(CommandHandler("setwallet", setwallet))
-app.add_handler(CommandHandler("setslippage", setslippage))
+app.add_handler(CommandHandler("set slippage", setslippage))
 app.add_handler(CommandHandler("setpresettargets", setpresettargets))
 app.add_handler(CommandHandler("setpresetstoploss", setpresetstoploss))
 app.add_handler(CallbackQueryHandler(button_callback))
