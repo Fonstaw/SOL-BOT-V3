@@ -136,7 +136,6 @@ def execute_swap_route(route, output_mint):
             "quoteResponse": route,
             "userPublicKey": str(payer.pubkey()),
             "wrapAndUnwrapSol": True,
-            # --- THE FIX: Force Jupiter to send a legacy transaction for compatibility ---
             "asLegacyTransaction": True,
         }
         swap_resp = requests.post(swap_url, json=swap_payload)
@@ -152,14 +151,18 @@ def execute_swap_route(route, output_mint):
         logger.info("Decoding transaction bytes")
         tx_bytes = base64.b64decode(tx_base64)
         
-        # Use the legacy Transaction object, which is compatible with older libraries
         tx = Transaction.from_bytes(tx_bytes)
         
-        # Sign the legacy transaction in-place. This method is stable across versions.
-        tx.sign(payer)
+        # --- THE FIX: ---
+        # Your library's .sign() method requires the recent_blockhash as a second argument.
+        # We will get it from the transaction object itself and provide it.
+        if tx.recent_blockhash is None:
+            logger.error("FATAL: Transaction from Jupiter is missing a blockhash.")
+            return None
+
+        tx.sign(payer, tx.recent_blockhash)
 
         logger.info("Sending signed transaction")
-        # Send the already-signed transaction using the simplest, most compatible method.
         resp = sol_client.send_transaction(tx)
         
         sig = resp.value if hasattr(resp, 'value') else resp.get('result')
