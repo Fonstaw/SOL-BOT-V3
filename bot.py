@@ -123,7 +123,7 @@ def get_swap_quote(input_mint, output_mint, amount):
         "outputMint": output_mint,
         "amount": raw_amount,
         "slippageBps": SLIPPAGE_BPS,
-        "onlyDirectRoutes": False,
+        "onlyDirectRoutes": "false",
     }
 
     try:
