@@ -15,7 +15,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Callb
 from solana.rpc.api import Client
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
-from solders.transaction import Transaction
+from solders.transaction import VersionedTransaction
 from solana.rpc.types import TxOpts
 from spl.token.client import Token
 from spl.token.constants import TOKEN_PROGRAM_ID
@@ -151,7 +151,7 @@ def execute_swap_route(route, output_mint):
         logger.info("Decoding transaction bytes")
         tx_bytes = base64.b64decode(tx_base64)
         
-        tx = Transaction.from_bytes(tx_bytes)
+        tx = VersionedTransaction.from_bytes(tx_bytes)
         tx.sign(payer)
 
         logger.info("Sending signed transaction")
