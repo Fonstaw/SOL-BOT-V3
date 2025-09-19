@@ -150,15 +150,15 @@ def execute_swap_route(route, output_mint):
         logger.info("Decoding transaction bytes")
         tx_bytes = base64.b64decode(tx_base64)
         
-        # Use VersionedTransaction to handle the modern format
         tx = VersionedTransaction.from_bytes(tx_bytes)
         
         # --- THE FIX: ---
-        # 1. REMOVE the incorrect tx.sign() line.
-        # 2. PASS the 'payer' Keypair directly into send_transaction.
+        # Your library version expects the 'opts' argument BEFORE the 'payer' (signer).
+        # We will now pass them in the correct order.
         
         logger.info("Sending signed transaction")
-        resp = sol_client.send_transaction(tx, payer, opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed"))
+        transaction_options = TxOpts(skip_preflight=False, preflight_commitment="confirmed")
+        resp = sol_client.send_transaction(tx, transaction_options, payer)
         
         sig = resp.value if hasattr(resp, 'value') else resp.get('result')
         
