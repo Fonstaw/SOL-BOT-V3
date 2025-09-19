@@ -15,7 +15,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Callb
 from solana.rpc.api import Client
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
-from solders.transaction import VersionedTransaction
+from solders.transaction import Transaction
 from solana.rpc.types import TxOpts
 from spl.token.client import Token
 from spl.token.constants import TOKEN_PROGRAM_ID
@@ -136,6 +136,8 @@ def execute_swap_route(route, output_mint):
             "quoteResponse": route,
             "userPublicKey": str(payer.pubkey()),
             "wrapAndUnwrapSol": True,
+            # --- THE FIX: Force Jupiter to send a legacy transaction for compatibility ---
+            "asLegacyTransaction": True,
         }
         swap_resp = requests.post(swap_url, json=swap_payload)
         swap_resp.raise_for_status()
@@ -150,14 +152,15 @@ def execute_swap_route(route, output_mint):
         logger.info("Decoding transaction bytes")
         tx_bytes = base64.b64decode(tx_base64)
         
-        tx = VersionedTransaction.from_bytes(tx_bytes)
+        # Use the legacy Transaction object, which is compatible with older libraries
+        tx = Transaction.from_bytes(tx_bytes)
         
-        # --- THE FIX: ---
-        # We simplify the call by removing the 'opts' argument, which is causing conflicts
-        # in your library version. This uses the server's default (and safe) options.
-        
+        # Sign the legacy transaction in-place. This method is stable across versions.
+        tx.sign(payer)
+
         logger.info("Sending signed transaction")
-        resp = sol_client.send_transaction(tx, payer)
+        # Send the already-signed transaction using the simplest, most compatible method.
+        resp = sol_client.send_transaction(tx)
         
         sig = resp.value if hasattr(resp, 'value') else resp.get('result')
         
