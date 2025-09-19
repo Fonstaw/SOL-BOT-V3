@@ -145,45 +145,37 @@ def execute_swap_route(route, output_mint):
         tx_base64 = response_json.get("swapTransaction")
         
         if not tx_base64:
-            logger.error(f"Failed to get swapTransaction from Jupiter API. Response: {response_json}")
+            logger.error(f"Failed to get swapTransaction from Jupiter API: {response_json}")
             return None
 
         logger.info("Decoding transaction bytes")
         tx_bytes = base64.b64decode(tx_base64)
         
-        # --- THE DEFINITIVE FIX FOR MODERN IMMUTABLE LIBRARIES ---
-
-        # 1. Decode the incomplete transaction from Jupiter to extract its parts
         original_tx = VersionedTransaction.from_bytes(tx_bytes)
-        original_message = original_tx.message
-
-        # 2. Fetch the latest blockhash from the network
+        
         logger.info("Fetching latest blockhash...")
         latest_blockhash_res = sol_client.get_latest_blockhash()
         blockhash = latest_blockhash_res.value.blockhash
 
-        # 3. Rebuild the transaction message with the new blockhash
-        rebuilt_message = MessageV0(
-            payer_key=original_message.payer_key,
-            instructions=original_message.instructions,
-            address_lookup_tables=original_message.address_lookup_tables,
+        # --- THE DEFINITIVE FIX BASED ON THE 'payer_key' ERROR ---
+        # 1. Rebuild the message using the fee payer from the correct location: account_keys[0]
+        rebuilt_message = MessageV0.new_with_lookup_tables(
+            payer=original_tx.message.account_keys[0],
+            instructions=original_tx.message.instructions,
+            address_lookup_tables=original_tx.message.address_lookup_tables,
             recent_blockhash=blockhash
         )
 
-        # 4. Create a new, complete but unsigned transaction
+        # 2. Create a new, complete but unsigned transaction with an EMPTY signature list
         rebuilt_tx = VersionedTransaction(rebuilt_message, [])
 
         logger.info(f"Sending rebuilt transaction with blockhash: {blockhash}")
-        # 5. Let the modern library handle signing and sending
+        # 3. Let the modern library handle signing and sending
         transaction_options = TxOpts(skip_preflight=False, preflight_commitment="confirmed")
         resp = sol_client.send_transaction(rebuilt_tx, payer, opts=transaction_options)
         
-        sig = resp.value if hasattr(resp, 'value') else resp.get('result')
+        sig = resp.value
         
-        if not sig:
-            logger.error(f"Failed to extract signature from response: {resp}")
-            return None
-            
         logger.info(f"Transaction signature: {sig}")
         sol_client.confirm_transaction(sig, commitment="confirmed")
         logger.info(f"Transaction confirmed: https://solscan.io/tx/{sig}")
