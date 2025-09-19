@@ -140,7 +140,6 @@ def execute_swap_route(route, output_mint):
         swap_resp = requests.post(swap_url, json=swap_payload)
         swap_resp.raise_for_status()
         
-        # --- IMPROVEMENT: Check if swapTransaction was actually returned ---
         response_json = swap_resp.json()
         tx_base64 = response_json.get("swapTransaction")
         
@@ -151,11 +150,16 @@ def execute_swap_route(route, output_mint):
         logger.info("Decoding transaction bytes")
         tx_bytes = base64.b64decode(tx_base64)
         
+        # Use VersionedTransaction to handle the modern format
         tx = VersionedTransaction.from_bytes(tx_bytes)
-        tx.sign(payer)
-
+        
+        # --- THE FIX: ---
+        # 1. REMOVE the incorrect tx.sign() line.
+        # 2. PASS the 'payer' Keypair directly into send_transaction.
+        
         logger.info("Sending signed transaction")
-        resp = sol_client.send_transaction(tx, opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed"))
+        resp = sol_client.send_transaction(tx, payer, opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed"))
+        
         sig = resp.value if hasattr(resp, 'value') else resp.get('result')
         
         if not sig:
