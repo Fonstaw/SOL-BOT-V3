@@ -1,5 +1,6 @@
 from solders.transaction import VersionedTransaction
 from solana.rpc.types import TxOpts
+from solders.message import MessageV0
 import os
 import json
 import asyncio
@@ -150,23 +151,32 @@ def execute_swap_route(route, output_mint):
         logger.info("Decoding transaction bytes")
         tx_bytes = base64.b64decode(tx_base64)
         
-        # Create the modern VersionedTransaction object
-        tx = VersionedTransaction.from_bytes(tx_bytes)
-        
-        # --- THE CORRECT MODERN WORKFLOW ---
-        # 1. Fetch the latest blockhash from the network.
+        # --- THE DEFINITIVE FIX FOR MODERN IMMUTABLE LIBRARIES ---
+
+        # 1. Decode the incomplete transaction from Jupiter to extract its parts
+        original_tx = VersionedTransaction.from_bytes(tx_bytes)
+        original_message = original_tx.message
+
+        # 2. Fetch the latest blockhash from the network
         logger.info("Fetching latest blockhash...")
         latest_blockhash_res = sol_client.get_latest_blockhash()
         blockhash = latest_blockhash_res.value.blockhash
-        
-        # 2. Add the blockhash to the transaction message. This completes it.
-        tx.message.recent_blockhash = blockhash
-        
-        # 3. Let the modern library handle signing and sending.
-        logger.info(f"Sending transaction with blockhash: {blockhash}")
-        # Pass the completed transaction and the signer. opts must be a keyword argument.
-        transaction_options = TxOpts(skip_preflight=False, preflight_commitment="confirmed", max_retries=3)
-        resp = sol_client.send_transaction(tx, payer, opts=transaction_options)
+
+        # 3. Rebuild the transaction message with the new blockhash
+        rebuilt_message = MessageV0(
+            payer_key=original_message.payer_key,
+            instructions=original_message.instructions,
+            address_lookup_tables=original_message.address_lookup_tables,
+            recent_blockhash=blockhash
+        )
+
+        # 4. Create a new, complete but unsigned transaction
+        rebuilt_tx = VersionedTransaction(rebuilt_message, [])
+
+        logger.info(f"Sending rebuilt transaction with blockhash: {blockhash}")
+        # 5. Let the modern library handle signing and sending
+        transaction_options = TxOpts(skip_preflight=False, preflight_commitment="confirmed")
+        resp = sol_client.send_transaction(rebuilt_tx, payer, opts=transaction_options)
         
         sig = resp.value if hasattr(resp, 'value') else resp.get('result')
         
@@ -175,7 +185,6 @@ def execute_swap_route(route, output_mint):
             return None
             
         logger.info(f"Transaction signature: {sig}")
-        # We need to get the status of the signature to confirm
         sol_client.confirm_transaction(sig, commitment="confirmed")
         logger.info(f"Transaction confirmed: https://solscan.io/tx/{sig}")
         return resp
