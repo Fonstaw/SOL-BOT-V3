@@ -140,9 +140,12 @@ def execute_swap_route(route, output_mint):
         swap_resp = requests.post(swap_url, json=swap_payload)
         swap_resp.raise_for_status()
         
-        tx_base64 = swap_resp.json().get("swapTransaction")
+        # --- IMPROVEMENT: Check if swapTransaction was actually returned ---
+        response_json = swap_resp.json()
+        tx_base64 = response_json.get("swapTransaction")
+        
         if not tx_base64:
-            logger.error("Failed to get swapTransaction from Jupiter API response.")
+            logger.error(f"Failed to get swapTransaction from Jupiter API. Response: {response_json}")
             return None
 
         logger.info("Decoding transaction bytes")
@@ -164,7 +167,7 @@ def execute_swap_route(route, output_mint):
         logger.info(f"Transaction confirmed: https://solscan.io/tx/{sig}")
         return resp
     except Exception as e:
-        logger.error(f"Swap execution failed: {str(e)}")
+        logger.error(f"Swap execution failed: {e}")
         return None
 
 @retry(stop=stop_after_attempt(MAX_RETRIES), wait=wait_exponential(multiplier=1, min=2, max=10))
