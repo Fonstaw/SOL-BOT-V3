@@ -20,7 +20,7 @@ from solana.rpc.types import TxOpts
 from spl.token.client import Token
 from spl.token.constants import TOKEN_PROGRAM_ID
 
-# (The entire top part of your script remains exactly the same)
+# (All the configuration and core logic functions from before remain the same)
 # ...
 # Flask app for Web Service
 app_flask = Flask(__name__)
@@ -273,7 +273,7 @@ async def auto_sell_loop():
         await check_auto_sell()
         await asyncio.sleep(60)
 
-# (The Telegram command handlers, e.g., status, setamount, etc., are all unchanged)
+# (All Telegram command handlers like status, setamount, etc. are correct and unchanged)
 # ...
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received /status command")
@@ -444,7 +444,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         AUTO_BUY = not AUTO_BUY
         await query.message.reply_text(f"Auto-buy set to {AUTO_BUY}")
     # (Other button handlers are unchanged)
-
+    
 app.add_handler(CommandHandler("status", status))
 app.add_handler(CommandHandler("setamount", setamount))
 app.add_handler(CommandHandler("settargets", settargets))
@@ -475,58 +475,56 @@ async def new_message(event):
             for token in tokens:
                 if 32 <= len(token) <= 44 and all(c in "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz" for c in token):
                     logger.info(f"Detected token {token} in {env_channel}")
-                    # Schedule the async buy_token function to be run on the auto-sell loop's event loop
-                    asyncio.run_coroutine_threadsafe(buy_token(token), auto_sell_loop_instance)
+                    # --- IMPROVEMENT: Directly await the function since we are in the same loop ---
+                    await buy_token(token)
                 else:
                     logger.debug(f"Filtered out invalid potential token: {token}")
 
-# ------------------ MAIN EXECUTION ------------------ #
 def run_flask():
     app_flask.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 
-def run_auto_sell():
-    global auto_sell_loop_instance
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    auto_sell_loop_instance = loop # Store the loop instance
-    try:
-        loop.run_until_complete(auto_sell_loop())
-    finally:
-        loop.close()
-        logger.info("Auto-sell loop closed")
+# ------------------ NEW MAIN EXECUTION BLOCK ------------------ #
+async def main():
+    # Start Flask in a background thread as it is not async
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("Flask server started in a background thread.")
 
-# --- IMPROVEMENT: Create a dedicated function to run Telethon ---
-def run_telethon():
-    # Telethon runs in its own asyncio event loop in this thread
-    with tele_client:
-        logger.info("Telethon client is running in a dedicated thread.")
-        tele_client.run_until_disconnected()
+    # Start the python-telegram-bot handlers
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    logger.info("Telegram bot command handler started.")
+
+    # Start the auto-sell loop as a background async task
+    asyncio.create_task(auto_sell_loop())
+    logger.info("Auto-sell loop started as a background task.")
+
+    # Start the Telethon client
+    await tele_client.start()
+    logger.info("Telethon client for channel monitoring started.")
+    
+    # Keep the main function alive to allow all tasks to run
+    # This replaces the old app.run_polling() which was blocking everything
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    logger.info("Starting bot services...")
+    logger.info("Starting bot...")
     
-    # Verify environment variables
     required_envs = ["API_ID", "API_HASH", "SESSION_STRING", "BOT_TOKEN", "SOLANA_PRIVATE_KEY"]
     for env in required_envs:
         if not os.environ.get(env):
             logger.error(f"Missing required environment variable: {env}")
             exit(1)
 
-    # 1. Start Flask in a background thread
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info("Flask server started.")
-
-    # 2. Start the auto-sell loop in a background thread
-    auto_sell_thread = threading.Thread(target=run_auto_sell, daemon=True)
-    auto_sell_thread.start()
-    logger.info("Auto-sell loop started.")
-
-    # 3. Start the Telethon client in a background thread
-    telethon_thread = threading.Thread(target=run_telethon, daemon=True)
-    telethon_thread.start()
-
-    # 4. Run the python-telegram-bot in the main thread (this is a blocking call)
-    logger.info("Starting Telegram command handler...")
-    app.run_polling()
-    logger.info("Bot shutdown complete.")
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot shutting down...")
+    finally:
+        # Graceful shutdown (optional but good practice)
+        asyncio.run(app.updater.stop())
+        asyncio.run(app.stop())
+        asyncio.run(tele_client.disconnect())
+        logger.info("Bot shutdown complete.")
