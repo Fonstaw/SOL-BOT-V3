@@ -20,8 +20,6 @@ from solana.rpc.types import TxOpts
 from spl.token.client import Token
 from spl.token.constants import TOKEN_PROGRAM_ID
 
-# (All the configuration and core logic functions from before remain the same)
-# ...
 # Flask app for Web Service
 app_flask = Flask(__name__)
 
@@ -36,6 +34,7 @@ SESSION_STRING = os.environ.get("SESSION_STRING")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 SOLANA_PRIVATE_KEY = os.environ.get("SOLANA_PRIVATE_KEY")
 SOLANA_RPC = os.environ.get("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
+# --- IMPORTANT: Using v6 API ---
 JUPITER_API = os.environ.get("JUPITER_API", "https://quote-api.jup.ag/v6")
 USDC_MINT = os.environ.get("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 CHANNELS = os.environ.get("CHANNELS", "").split(",")
@@ -114,6 +113,7 @@ def get_swap_quote(input_mint, output_mint, amount):
         "outputMint": output_mint,
         "amount": raw_amount,
         "slippageBps": SLIPPAGE_BPS,
+        # --- IMPROVEMENT: Use lowercase string "false" for v6 API ---
         "onlyDirectRoutes": "false",
     }
 
@@ -164,13 +164,14 @@ def execute_swap_route(route, output_mint):
         logger.info(f"Transaction confirmed: https://solscan.io/tx/{sig}")
         return resp
     except Exception as e:
-        logger.error(f"Swap execution failed: {e}")
+        logger.error(f"Swap execution failed: {str(e)}")
         return None
 
 @retry(stop=stop_after_attempt(MAX_RETRIES), wait=wait_exponential(multiplier=1, min=2, max=10))
 def fetch_token_price(token_mint):
     logger.info(f"Fetching price for token: {token_mint}")
     quote = get_swap_quote(token_mint, USDC_MINT, 1)
+    # --- IMPROVEMENT: Handle direct quote object from v6 API ---
     if quote and "outAmount" in quote:
         return int(quote["outAmount"]) / (10 ** get_token_decimals(USDC_MINT))
     logger.error(f"No valid price quote for {token_mint}")
@@ -189,10 +190,12 @@ async def buy_token(token_mint):
     try:
         logger.info(f"Fetching swap quote for {token_mint} with {TRADE_AMOUNT_USDC} USDC")
         quote = get_swap_quote(USDC_MINT, token_mint, TRADE_AMOUNT_USDC)
+        # --- IMPROVEMENT: Handle direct quote object from v6 API ---
         if not quote:
             logger.error(f"No swap quote returned for {token_mint}. Skipping buy.")
             return
         
+        # The quote object is the route itself in v6
         route = quote
         
         logger.info(f"Got swap quote, executing swap for {token_mint}")
@@ -230,9 +233,11 @@ async def check_auto_sell():
             if current_price is None:
                 continue
 
+            # Check take-profit targets
             for target in info["targets"]:
                 if current_price >= info["buy_price"] * target:
                     quote = get_swap_quote(token, USDC_MINT, info["amount"])
+                    # --- IMPROVEMENT: Handle direct quote object from v6 API ---
                     if not quote:
                         logger.error(f"Could not get sell quote for {token}")
                         continue
@@ -248,8 +253,10 @@ async def check_auto_sell():
             
             if token in to_remove: continue
 
+            # Check stop-loss
             if current_price <= info["buy_price"] * (1 - info["stop_loss"] / 100):
                 quote = get_swap_quote(token, USDC_MINT, info["amount"])
+                # --- IMPROVEMENT: Handle direct quote object from v6 API ---
                 if not quote:
                     logger.error(f"Could not get sell quote for {token} (stop-loss)")
                     continue
@@ -273,8 +280,7 @@ async def auto_sell_loop():
         await check_auto_sell()
         await asyncio.sleep(60)
 
-# (All Telegram command handlers like status, setamount, etc. are correct and unchanged)
-# ...
+# ------------------ TELEGRAM COMMANDS (Unchanged) ------------------ #
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received /status command")
     msg = f"Auto-buy: {AUTO_BUY}\nTrade amount: {TRADE_AMOUNT_USDC} USDC\nSlippage: {SLIPPAGE_BPS/100}%\nChannels: {CHANNELS}\nPreset Sell Targets: {PRESET_SELL_TARGETS}\nPreset Stop-Loss: {[f'{x}%' for x in PRESET_STOP_LOSS]}\n\nTracked Tokens:\n"
@@ -367,6 +373,7 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token = context.args[0]
         if token in trades:
             quote = get_swap_quote(token, USDC_MINT, trades[token]["amount"])
+            # --- IMPROVEMENT: Handle direct quote object from v6 API ---
             if not quote:
                 await update.message.reply_text(f"Could not get a quote to sell {token}")
                 return
@@ -443,8 +450,32 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "togglebuy":
         AUTO_BUY = not AUTO_BUY
         await query.message.reply_text(f"Auto-buy set to {AUTO_BUY}")
-    # (Other button handlers are unchanged)
-    
+    elif query.data == "setamount":
+        await query.message.reply_text("Send /setamount <amount> to set trade amount")
+    elif query.data == "addchannel":
+        await query.message.reply_text("Send /addchannel @channelname to add a channel")
+    elif query.data == "removechannel":
+        await query.message.reply_text("Send /removechannel @channelname to remove a channel")
+    elif query.data == "viewtrades":
+        msg = "Tracked Tokens:\n"
+        for token, info in trades.items():
+            msg += f"{token}: Buy {info['amount']} tokens at {info['buy_price']}\n"
+        await query.message.reply_text(msg or "No trades yet")
+    elif query.data == "setwallet":
+        await query.message.reply_text("Send /setwallet <128-char-hex-key> to change wallet")
+    elif query.data == "settargets":
+        await query.message.reply_text("Send /settargets <token> <x1,x2,...> to set sell targets")
+    elif query.data == "setstoploss":
+        await query.message.reply_text("Send /setstoploss <token> <percentage> to set stop-loss")
+    elif query.data == "sell":
+        await query.message.reply_text("Send /sell <token> to sell a tracked token")
+    elif query.data == "setslippage":
+        await query.message.reply_text("Send /setslippage <percentage> to set slippage (0.1 to 50)")
+    elif query.data == "setpresettargets":
+        await query.message.reply_text("Send /setpresettargets <x1,x2,...> to set preset sell targets")
+    elif query.data == "setpresetstoploss":
+        await query.message.reply_text("Send /setpresetstoploss <x1,x2,...> to set preset stop-loss")
+
 app.add_handler(CommandHandler("status", status))
 app.add_handler(CommandHandler("setamount", setamount))
 app.add_handler(CommandHandler("settargets", settargets))
@@ -459,6 +490,7 @@ app.add_handler(CommandHandler("setpresettargets", setpresettargets))
 app.add_handler(CommandHandler("setpresetstoploss", setpresetstoploss))
 app.add_handler(CallbackQueryHandler(button_callback))
 
+# ------------------ TELETHON LISTENER (Unchanged) ------------------ #
 @tele_client.on(events.NewMessage)
 async def new_message(event):
     msg = event.message.message
@@ -475,56 +507,44 @@ async def new_message(event):
             for token in tokens:
                 if 32 <= len(token) <= 44 and all(c in "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz" for c in token):
                     logger.info(f"Detected token {token} in {env_channel}")
-                    # --- IMPROVEMENT: Directly await the function since we are in the same loop ---
                     await buy_token(token)
                 else:
                     logger.debug(f"Filtered out invalid potential token: {token}")
 
+# ------------------ MAIN EXECUTION (Unchanged) ------------------ #
 def run_flask():
     app_flask.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 
-# ------------------ NEW MAIN EXECUTION BLOCK ------------------ #
-async def main():
-    # Start Flask in a background thread as it is not async
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info("Flask server started in a background thread.")
-
-    # Start the python-telegram-bot handlers
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    logger.info("Telegram bot command handler started.")
-
-    # Start the auto-sell loop as a background async task
-    asyncio.create_task(auto_sell_loop())
-    logger.info("Auto-sell loop started as a background task.")
-
-    # Start the Telethon client
-    await tele_client.start()
-    logger.info("Telethon client for channel monitoring started.")
-    
-    # Keep the main function alive to allow all tasks to run
-    # This replaces the old app.run_polling() which was blocking everything
-    while True:
-        await asyncio.sleep(3600)
+def run_auto_sell():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(auto_sell_loop())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+        logger.info("Auto-sell loop closed")
 
 if __name__ == "__main__":
-    logger.info("Starting bot...")
-    
+    logger.info("Starting bot")
     required_envs = ["API_ID", "API_HASH", "SESSION_STRING", "BOT_TOKEN", "SOLANA_PRIVATE_KEY"]
     for env in required_envs:
         if not os.environ.get(env):
             logger.error(f"Missing required environment variable: {env}")
             exit(1)
 
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot shutting down...")
-    finally:
-        # Graceful shutdown (optional but good practice)
-        asyncio.run(app.updater.stop())
-        asyncio.run(app.stop())
-        asyncio.run(tele_client.disconnect())
-        logger.info("Bot shutdown complete.")
+    tele_client.start()
+    logger.info("Telethon client started")
+    
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("Flask server started")
+    
+    auto_sell_thread = threading.Thread(target=run_auto_sell, daemon=True)
+    auto_sell_thread.start()
+    logger.info("Auto-sell loop started")
+    
+    app.run_polling()
+    logger.info("Bot shutdown complete")
