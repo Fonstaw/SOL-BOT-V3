@@ -34,17 +34,17 @@ SESSION_STRING = os.environ.get("SESSION_STRING")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 SOLANA_PRIVATE_KEY = os.environ.get("SOLANA_PRIVATE_KEY")
 SOLANA_RPC = os.environ.get("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
-JUPITER_API = os.environ.get("JUPITER_API", "https://quote-api.jup.ag/v4")
+# --- IMPORTANT: Using v6 API ---
+JUPITER_API = os.environ.get("JUPITER_API", "https://quote-api.jup.ag/v6")
 USDC_MINT = os.environ.get("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 CHANNELS = os.environ.get("CHANNELS", "").split(",")
 
 # Preset auto-sell targets and stop-loss (as percentages) for new tokens
 PRESET_SELL_TARGETS = [2, 3, 5, 10, 20, 50]
-PRESET_STOP_LOSS = [10, 20, 30, 35, 40, 50, 60, 70, 80, 90]  # Percentages (10% = 0.9 multiplier, etc.)
-AUTO_SELL_TARGETS = [float(x) for x in os.environ.get("AUTO_SELL_TARGETS", "2,3,5").split(",")]
+PRESET_STOP_LOSS = [10, 20, 30, 35, 40, 50, 60, 70, 80, 90]
 AUTO_BUY = os.environ.get("AUTO_BUY", "true").lower() == "true"
 TRADE_AMOUNT_USDC = float(os.environ.get("TRADE_AMOUNT_USDC", 0.01))
-SLIPPAGE_BPS = int(os.environ.get("SLIPPAGE_BPS", 100))  # Default 1% (100 basis points)
+SLIPPAGE_BPS = int(os.environ.get("SLIPPAGE_BPS", 100))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", 3))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
@@ -82,10 +82,6 @@ sol_client = Client(SOLANA_RPC)
 logger.info(f"Connected to Solana RPC: {SOLANA_RPC}")
 
 def get_token_decimals(mint: str) -> int:
-    """
-    Return decimals for an SPL token mint address using spl.token client.
-    Falls back to 6 if it cannot fetch.
-    """
     try:
         mint_pubkey = Pubkey.from_string(mint)
         token = Token(sol_client, mint_pubkey, TOKEN_PROGRAM_ID, payer)
@@ -107,13 +103,7 @@ logger.info("Telethon client initialized")
 # ------------------ JUPITER FUNCTIONS ------------------ #
 @retry(stop=stop_after_attempt(MAX_RETRIES), wait=wait_exponential(multiplier=1, min=2, max=10))
 def get_swap_quote(input_mint, output_mint, amount):
-    """
-    Ask Jupiter for a swap quote. `amount` is in human units (e.g. 2.0 USDC).
-    We convert to the smallest unit using the token's decimals.
-    """
     logger.info(f"Getting swap quote: input={input_mint}, output={output_mint}, amount={amount}, slippage={SLIPPAGE_BPS}")
-
-    # Convert the human amount to the smallest unit for the input token
     decimals_in = get_token_decimals(input_mint)
     raw_amount = int(amount * (10 ** decimals_in))
 
@@ -123,6 +113,7 @@ def get_swap_quote(input_mint, output_mint, amount):
         "outputMint": output_mint,
         "amount": raw_amount,
         "slippageBps": SLIPPAGE_BPS,
+        # --- IMPROVEMENT: Use lowercase string "false" for v6 API ---
         "onlyDirectRoutes": "false",
     }
 
@@ -139,37 +130,36 @@ def get_swap_quote(input_mint, output_mint, amount):
 
 def execute_swap_route(route, output_mint):
     try:
-        # Jupiter provides 'otherAmountThreshold' which accounts for slippageBps.
-        # The on-chain program will use this to ensure you don't receive less than expected.
-        out_amount_base = int(route["outAmount"])
-        min_amount_out = int(route["otherAmountThreshold"])
-        logger.info(
-            f"Executing swap for {output_mint}. "
-            f"Quoted out amount: {out_amount_base}, "
-            f"Minimum to receive (slippage adjusted): {min_amount_out}"
-        )
+        logger.info("Getting swap transaction from Jupiter API")
+        swap_url = f"{JUPITER_API}/swap"
+        swap_payload = {
+            "quoteResponse": route,
+            "userPublicKey": str(payer.pubkey()),
+            "wrapAndUnwrapSol": True,
+        }
+        swap_resp = requests.post(swap_url, json=swap_payload)
+        swap_resp.raise_for_status()
+        
+        tx_base64 = swap_resp.json().get("swapTransaction")
+        if not tx_base64:
+            logger.error("Failed to get swapTransaction from Jupiter API response.")
+            return None
 
         logger.info("Decoding transaction bytes")
-        tx_bytes = base64.b64decode(route["swapTransaction"])
-
-        # 1. Deserialize into a Transaction object
+        tx_bytes = base64.b64decode(tx_base64)
+        
         tx = Transaction.deserialize(tx_bytes)
-
-        # 2. Sign with your payer keypair
         tx.sign(payer)
 
-        # 3. Send transaction and wait for confirmation
         logger.info("Sending signed transaction")
-        # The response structure from send_transaction can vary. Handle it robustly.
         resp = sol_client.send_transaction(tx, opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed"))
         sig = resp.value if hasattr(resp, 'value') else resp.get('result')
+        
         if not sig:
             logger.error(f"Failed to extract signature from response: {resp}")
             return None
             
         logger.info(f"Transaction signature: {sig}")
-
-        # 4. Confirm transaction
         sol_client.confirm_transaction(sig, commitment="confirmed")
         logger.info(f"Transaction confirmed: https://solscan.io/tx/{sig}")
         return resp
@@ -181,11 +171,11 @@ def execute_swap_route(route, output_mint):
 def fetch_token_price(token_mint):
     logger.info(f"Fetching price for token: {token_mint}")
     quote = get_swap_quote(token_mint, USDC_MINT, 1)
-    if quote and "data" in quote and quote["data"]:
-        return int(quote["data"][0]["outAmount"]) / (10 ** get_token_decimals(USDC_MINT))
+    # --- IMPROVEMENT: Handle direct quote object from v6 API ---
+    if quote and "outAmount" in quote:
+        return int(quote["outAmount"]) / (10 ** get_token_decimals(USDC_MINT))
     logger.error(f"No valid price quote for {token_mint}")
     return None
-
 
 # ------------------ TRADE LOGIC ------------------ #
 async def buy_token(token_mint):
@@ -200,30 +190,29 @@ async def buy_token(token_mint):
     try:
         logger.info(f"Fetching swap quote for {token_mint} with {TRADE_AMOUNT_USDC} USDC")
         quote = get_swap_quote(USDC_MINT, token_mint, TRADE_AMOUNT_USDC)
+        # --- IMPROVEMENT: Handle direct quote object from v6 API ---
         if not quote:
             logger.error(f"No swap quote returned for {token_mint}. Skipping buy.")
             return
-        if not quote.get("data"):
-            logger.error(f"No valid swap quote data for {token_mint}: {quote}")
-            return
-        route = quote["data"][0]
-        logger.info(f"Got swap quote: {route}")
-        logger.info(f"Executing swap for {token_mint}")
+        
+        # The quote object is the route itself in v6
+        route = quote
+        
+        logger.info(f"Got swap quote, executing swap for {token_mint}")
         resp = execute_swap_route(route, token_mint)
         if resp:
             logger.info(f"Swap successful for {token_mint}, fetching price")
             buy_price = fetch_token_price(token_mint)
-
-            # NEW: how many tokens did we actually receive?
-            out_amount_base = int(route["outAmount"])  # base units returned by Jupiter
-            token_decimals = get_token_decimals(token_mint)  # your decimals helper
+            
+            out_amount_base = int(route["outAmount"])
+            token_decimals = get_token_decimals(token_mint)
             out_amount_human = out_amount_base / (10 ** token_decimals)
 
             trades[token_mint] = {
-                "buy_price": buy_price,          # price in USDC
-                "amount": out_amount_human,      # store token quantity you now hold
+                "buy_price": buy_price,
+                "amount": out_amount_human,
                 "targets": PRESET_SELL_TARGETS.copy(),
-                "stop_loss": PRESET_STOP_LOSS[2],  # Default to 30%
+                "stop_loss": PRESET_STOP_LOSS[2],
             }
             save_trades(trades)
             logger.info(
@@ -238,22 +227,21 @@ async def buy_token(token_mint):
 async def check_auto_sell():
     global trades
     to_remove = []
-    # Create a copy of items to avoid issues with modifying the dictionary during iteration
     for token, info in list(trades.items()):
         try:
             current_price = fetch_token_price(token)
             if current_price is None:
                 continue
-            
-            # Check for take-profit targets
+
+            # Check take-profit targets
             for target in info["targets"]:
                 if current_price >= info["buy_price"] * target:
-                    logger.info(f"Take-profit target {target}x hit for {token}. Attempting to sell.")
                     quote = get_swap_quote(token, USDC_MINT, info["amount"])
-                    if not quote or not quote.get("data"):
+                    # --- IMPROVEMENT: Handle direct quote object from v6 API ---
+                    if not quote:
                         logger.error(f"Could not get sell quote for {token}")
                         continue
-                    route = quote["data"][0]
+                    route = quote
                     resp = execute_swap_route(route, USDC_MINT)
                     if resp:
                         out_amount_base = int(route["outAmount"])
@@ -261,20 +249,18 @@ async def check_auto_sell():
                         out_amount_human = out_amount_base / (10 ** usdc_decimals)
                         logger.info(f"Sold {info['amount']} of {token} for {out_amount_human} USDC at {current_price} (target {target}x)")
                         to_remove.append(token)
-                        break  # Exit the inner loop once sold
+                        break
             
-            if token in to_remove: # If sold based on target, skip stop-loss check
-                continue
+            if token in to_remove: continue
 
-            # Check for stop-loss
-            stop_loss_price = info["buy_price"] * (1 - info["stop_loss"] / 100)
-            if current_price <= stop_loss_price:
-                logger.info(f"Stop-loss of {info['stop_loss']}% hit for {token}. Attempting to sell.")
+            # Check stop-loss
+            if current_price <= info["buy_price"] * (1 - info["stop_loss"] / 100):
                 quote = get_swap_quote(token, USDC_MINT, info["amount"])
-                if not quote or not quote.get("data"):
+                # --- IMPROVEMENT: Handle direct quote object from v6 API ---
+                if not quote:
                     logger.error(f"Could not get sell quote for {token} (stop-loss)")
                     continue
-                route = quote["data"][0]
+                route = quote
                 resp = execute_swap_route(route, USDC_MINT)
                 if resp:
                     out_amount_base = int(route["outAmount"])
@@ -282,16 +268,11 @@ async def check_auto_sell():
                     out_amount_human = out_amount_base / (10 ** usdc_decimals)
                     logger.info(f"Sold {info['amount']} of {token} for {out_amount_human} USDC at {current_price} (stop-loss {info['stop_loss']}%)")
                     to_remove.append(token)
-
         except Exception as e:
             logger.error(f"Auto-sell error for {token}: {e}")
-            
-    if to_remove:
-        for token in to_remove:
-            if token in trades:
-                trades.pop(token)
-        save_trades(trades)
-
+    for token in to_remove:
+        if token in trades: trades.pop(token)
+    save_trades(trades)
 
 async def auto_sell_loop():
     logger.info("Starting auto-sell loop")
@@ -299,37 +280,19 @@ async def auto_sell_loop():
         await check_auto_sell()
         await asyncio.sleep(60)
 
-# ------------------ TELEGRAM COMMANDS ------------------ #
+# ------------------ TELEGRAM COMMANDS (Unchanged) ------------------ #
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received /status command")
     msg = f"Auto-buy: {AUTO_BUY}\nTrade amount: {TRADE_AMOUNT_USDC} USDC\nSlippage: {SLIPPAGE_BPS/100}%\nChannels: {CHANNELS}\nPreset Sell Targets: {PRESET_SELL_TARGETS}\nPreset Stop-Loss: {[f'{x}%' for x in PRESET_STOP_LOSS]}\n\nTracked Tokens:\n"
     for token, info in trades.items():
         msg += f"{token}: Buy {info['amount']} tokens at {info['buy_price']}, Targets {info['targets']}, Stop-loss {info['stop_loss']}%\n"
     keyboard = [
-        [
-            InlineKeyboardButton("Toggle Auto-Buy", callback_data="togglebuy"),
-            InlineKeyboardButton("Set Amount", callback_data="setamount"),
-        ],
-        [
-            InlineKeyboardButton("Add Channel", callback_data="addchannel"),
-            InlineKeyboardButton("Remove Channel", callback_data="removechannel"),
-        ],
-        [
-            InlineKeyboardButton("View Trades", callback_data="viewtrades"),
-            InlineKeyboardButton("Change Wallet", callback_data="setwallet"),
-        ],
-        [
-            InlineKeyboardButton("Set Targets", callback_data="settargets"),
-            InlineKeyboardButton("Set Stop-Loss", callback_data="setstoploss"),
-        ],
-        [
-            InlineKeyboardButton("Sell Token", callback_data="sell"),
-            InlineKeyboardButton("Set Slippage", callback_data="setslippage"),
-        ],
-        [
-            InlineKeyboardButton("Set Preset Targets", callback_data="setpresettargets"),
-            InlineKeyboardButton("Set Preset Stop-Loss", callback_data="setpresetstoploss"),
-        ],
+        [InlineKeyboardButton("Toggle Auto-Buy", callback_data="togglebuy"), InlineKeyboardButton("Set Amount", callback_data="setamount")],
+        [InlineKeyboardButton("Add Channel", callback_data="addchannel"), InlineKeyboardButton("Remove Channel", callback_data="removechannel")],
+        [InlineKeyboardButton("View Trades", callback_data="viewtrades"), InlineKeyboardButton("Change Wallet", callback_data="setwallet")],
+        [InlineKeyboardButton("Set Targets", callback_data="settargets"), InlineKeyboardButton("Set Stop-Loss", callback_data="setstoploss")],
+        [InlineKeyboardButton("Sell Token", callback_data="sell"), InlineKeyboardButton("Set Slippage", callback_data="setslippage")],
+        [InlineKeyboardButton("Set Preset Targets", callback_data="setpresettargets"), InlineKeyboardButton("Set Preset Stop-Loss", callback_data="setpresetstoploss")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(msg, reply_markup=reply_markup)
@@ -410,10 +373,11 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token = context.args[0]
         if token in trades:
             quote = get_swap_quote(token, USDC_MINT, trades[token]["amount"])
-            if not quote or not quote.get("data"):
+            # --- IMPROVEMENT: Handle direct quote object from v6 API ---
+            if not quote:
                 await update.message.reply_text(f"Could not get a quote to sell {token}")
                 return
-            route = quote["data"][0]
+            route = quote
             resp = execute_swap_route(route, USDC_MINT)
             if resp:
                 out_amount_base = int(route["outAmount"])
@@ -435,8 +399,7 @@ async def setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global payer
     try:
         new_key = context.args[0]
-        key_bytes = bytes.fromhex(new_key)
-        payer = Keypair.from_bytes(key_bytes)
+        payer = Keypair.from_bytes(bytes.fromhex(new_key))
         await update.message.reply_text("Wallet updated successfully")
     except Exception as e:
         await update.message.reply_text(f"Failed to update wallet: {e}")
@@ -446,7 +409,7 @@ async def setslippage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global SLIPPAGE_BPS
     try:
         slippage_percent = float(context.args[0])
-        if 0.1 <= slippage_percent <= 50: # Increased max slippage
+        if 0.1 <= slippage_percent <= 50:
             SLIPPAGE_BPS = int(slippage_percent * 100)
             await update.message.reply_text(f"Slippage updated to {slippage_percent}% ({SLIPPAGE_BPS} bps)")
         else:
@@ -513,7 +476,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "setpresetstoploss":
         await query.message.reply_text("Send /setpresetstoploss <x1,x2,...> to set preset stop-loss")
 
-# Register commands
 app.add_handler(CommandHandler("status", status))
 app.add_handler(CommandHandler("setamount", setamount))
 app.add_handler(CommandHandler("settargets", settargets))
@@ -528,11 +490,10 @@ app.add_handler(CommandHandler("setpresettargets", setpresettargets))
 app.add_handler(CommandHandler("setpresetstoploss", setpresetstoploss))
 app.add_handler(CallbackQueryHandler(button_callback))
 
-# ------------------ TELETHON LISTENER ------------------ #
+# ------------------ TELETHON LISTENER (Unchanged) ------------------ #
 @tele_client.on(events.NewMessage)
 async def new_message(event):
     msg = event.message.message
-    # Safety check - ensure chat exists
     if not event.chat:
         logger.debug("Received message from unknown chat, skipping")
         return
@@ -541,19 +502,16 @@ async def new_message(event):
         env_channel = channel.lower().strip().lstrip("@")
         if chat_username == env_channel:
             logger.info(f"Message detected in channel {env_channel}: {msg}")
-            # A more robust regex for Solana addresses
             token_pattern = r'\b([1-9A-HJ-NP-Za-km-z]{32,44})\b'
             tokens = re.findall(token_pattern, msg)
             for token in tokens:
-                # Basic validation for Base58 characters and length
                 if 32 <= len(token) <= 44 and all(c in "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz" for c in token):
                     logger.info(f"Detected token {token} in {env_channel}")
                     await buy_token(token)
                 else:
                     logger.debug(f"Filtered out invalid potential token: {token}")
 
-
-# ------------------ MAIN EXECUTION ------------------ #
+# ------------------ MAIN EXECUTION (Unchanged) ------------------ #
 def run_flask():
     app_flask.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 
@@ -571,29 +529,22 @@ def run_auto_sell():
 
 if __name__ == "__main__":
     logger.info("Starting bot")
-    required_envs = [
-        "API_ID", "API_HASH", "SESSION_STRING", "BOT_TOKEN",
-        "SOLANA_PRIVATE_KEY"
-    ]
+    required_envs = ["API_ID", "API_HASH", "SESSION_STRING", "BOT_TOKEN", "SOLANA_PRIVATE_KEY"]
     for env in required_envs:
         if not os.environ.get(env):
             logger.error(f"Missing required environment variable: {env}")
             exit(1)
 
-    # Start Telethon client
     tele_client.start()
     logger.info("Telethon client started")
-
-    # Start Flask in a thread
+    
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logger.info("Flask server started")
-
-    # Start auto-sell loop in a thread
+    
     auto_sell_thread = threading.Thread(target=run_auto_sell, daemon=True)
     auto_sell_thread.start()
     logger.info("Auto-sell loop started")
-
-    # Run Telegram bot
+    
     app.run_polling()
     logger.info("Bot shutdown complete")
