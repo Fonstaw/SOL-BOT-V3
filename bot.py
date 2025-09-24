@@ -40,7 +40,7 @@ SOLANA_RPC = os.environ.get("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
 JUPITER_API = os.environ.get("JUPITER_API", "https://quote-api.jup.ag/v6")
 USDC_MINT = os.environ.get("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 CHANNELS = os.environ.get("CHANNELS", "").split(",")
-CHAT_ID = os.environ.get("CHAT_ID")  # String for validation
+CHAT_ID = os.environ.get("CHAT_ID")
 
 # Preset auto-sell targets and stop-loss (as percentages) for new tokens
 PRESET_SELL_TARGETS = [2, 3, 5, 10, 20, 50]
@@ -176,10 +176,6 @@ def get_swap_quote(input_mint, output_mint, amount):
         return None
 
 def execute_swap_route(route, output_mint):
-    """
-    route = the quote response you passed to /swap (Jupiter's v6)
-    returns solana-py response (or None on failure)
-    """
     try:
         logger.info("Getting swap transaction from Jupiter API")
         swap_url = f"{JUPITER_API}/swap"
@@ -324,7 +320,7 @@ async def buy_token(token_mint):
         buy_price = fetch_token_price(token_mint)
         if buy_price is None:
             logger.error(f"Failed to fetch buy price for {token_mint}. Proceeding with default values.")
-            buy_price = 0  # Default to avoid breaking trade storage
+            buy_price = 0
 
         out_amount_base = int(route["outAmount"])
         token_decimals = get_token_decimals(token_mint)
@@ -335,11 +331,14 @@ async def buy_token(token_mint):
         total_supply = token_info["total_supply"] if token_info else 0
         market_cap = total_supply * buy_price if buy_price and total_supply > 0 else "N/A"
 
+        logger.info(f"PRESET_STOP_LOSS: {PRESET_STOP_LOSS}")
+        stop_loss = PRESET_STOP_LOSS[2] if len(PRESET_STOP_LOSS) > 2 else 30  # Default to 30 if index 2 is unavailable
+
         trades[token_mint] = {
             "buy_price": buy_price,
             "amount": out_amount_human,
             "targets": PRESET_SELL_TARGETS.copy(),
-            "stop_loss": PRESET_STOP_LOSS[2],
+            "stop_loss": stop_loss,
             "name": name,
             "total_supply": total_supply,
         }
