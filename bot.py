@@ -1,3 +1,4 @@
+# bot.py
 from solders.transaction import VersionedTransaction
 from solders.message import to_bytes_versioned
 from solders.signature import Signature
@@ -265,7 +266,7 @@ async def buy_token(token_mint):
         route = quote
         
         logger.info(f"Got swap quote, executing swap for {token_mint}")
-        resp = execute_swap_route(route, token_mint)  # Updated to return only resp
+        resp = execute_swap_route(route, token_mint)
         if resp:
             logger.info(f"Swap successful for {token_mint}, fetching price")
             buy_price = fetch_token_price(token_mint)
@@ -276,7 +277,7 @@ async def buy_token(token_mint):
 
             ticker = get_token_ticker(token_mint)
             mc = get_market_cap(token_mint, buy_price)
-            sig = resp.value  # Extract signature from resp
+            sig = resp.value
             await app.bot.send_message(chat_id=CHAT_ID, text=f"🟢 Bought {out_amount_human} {ticker} ✅\n🔴 Market Cap {mc}\n💲 Amount Spent {TRADE_AMOUNT_USDC}\n🔗 https://solscan.io/tx/{sig}")
 
             trades[token_mint] = {
@@ -285,7 +286,7 @@ async def buy_token(token_mint):
                 "targets": PRESET_SELL_TARGETS.copy(),
                 "stop_loss": PRESET_STOP_LOSS[2],
                 "symbol": ticker,
-                "current_price": buy_price,  # Initial cache
+                "current_price": buy_price,
             }
             save_trades(trades)
             logger.info(
@@ -317,7 +318,7 @@ async def check_auto_sell():
                         logger.error(f"Could not get sell quote for {token}")
                         continue
                     route = quote
-                    resp = execute_swap_route(route, USDC_MINT)  # Updated to return only resp
+                    resp = execute_swap_route(route, USDC_MINT)
                     if resp:
                         out_amount_base = int(route["outAmount"])
                         usdc_decimals = get_token_decimals(USDC_MINT)
@@ -327,7 +328,7 @@ async def check_auto_sell():
                         change_str = f"{percent_change:+.2f}% ({usdc_change:+.2f}$)"
                         ticker = info.get("symbol", "UNK")
                         mc = get_market_cap(token, current_price)
-                        sig = resp.value  # Extract signature from resp
+                        sig = resp.value
                         await app.bot.send_message(chat_id=CHAT_ID, text=f"🔴 Sold {info['amount']} {ticker}\n⚪ Market Cap {mc}\n💲 Amount gotten {out_amount_human}\n📈 Profit/Loss: {change_str}\n🔗 https://solscan.io/tx/{sig}")
 
                         logger.info(f"Sold {info['amount']} of {token} for {out_amount_human} USDC at {current_price} (target {target}x)")
@@ -343,7 +344,7 @@ async def check_auto_sell():
                     logger.error(f"Could not get sell quote for {token} (stop-loss)")
                     continue
                 route = quote
-                resp = execute_swap_route(route, USDC_MINT)  # Updated to return only resp
+                resp = execute_swap_route(route, USDC_MINT)
                 if resp:
                     out_amount_base = int(route["outAmount"])
                     usdc_decimals = get_token_decimals(USDC_MINT)
@@ -353,7 +354,7 @@ async def check_auto_sell():
                     change_str = f"{percent_change:+.2f}% ({usdc_change:+.2f}$)"
                     ticker = info.get("symbol", "UNK")
                     mc = get_market_cap(token, current_price)
-                    sig = resp.value  # Extract signature from resp
+                    sig = resp.value
                     await app.bot.send_message(chat_id=CHAT_ID, text=f"🔴 Sold {info['amount']} {ticker}\n⚪ Market Cap {mc}\n💲 Amount gotten {out_amount_human}\n📈 Profit/Loss: {change_str}\n🔗 https://solscan.io/tx/{sig}")
 
                     logger.info(f"Sold {info['amount']} of {token} for {out_amount_human} USDC at {current_price} (stop-loss {info['stop_loss']}%)")
@@ -375,7 +376,7 @@ async def auto_sell_loop():
     logger.info("Starting auto-sell loop")
     while True:
         await check_auto_sell()
-        await update_prices()  # Update cached prices every 60s
+        await update_prices()
         await asyncio.sleep(60)
 
 # ------------------ TELEGRAM COMMANDS ------------------ #
@@ -492,7 +493,7 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"Could not get a quote to sell {token}")
                 return
             route = quote
-            resp = execute_swap_route(route, USDC_MINT)  # Updated to return only resp
+            resp = execute_swap_route(route, USDC_MINT)
             if resp:
                 out_amount_base = int(route["outAmount"])
                 usdc_decimals = get_token_decimals(USDC_MINT)
@@ -503,7 +504,7 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 change_str = f"{percent_change:+.2f}% ({usdc_change:+.2f}$)"
                 ticker = info.get("symbol", "UNK")
                 mc = get_market_cap(token, current_price) if current_price else "N/A"
-                sig = resp.value  # Extract signature from resp
+                sig = resp.value
                 await app.bot.send_message(chat_id=CHAT_ID, text=f"🔴 Sold {info['amount']} {ticker}\n⚪ Market Cap {mc}\n💲 Amount gotten {out_amount_human}\n📈 Profit/Loss: {change_str}\n🔗 https://solscan.io/tx/{sig}")
 
                 amount_sold = info['amount']
