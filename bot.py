@@ -37,11 +37,10 @@ SESSION_STRING = os.environ.get("SESSION_STRING")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 SOLANA_PRIVATE_KEY = os.environ.get("SOLANA_PRIVATE_KEY")
 SOLANA_RPC = os.environ.get("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
-# --- IMPORTANT: Using v6 API ---
 JUPITER_API = os.environ.get("JUPITER_API", "https://quote-api.jup.ag/v6")
 USDC_MINT = os.environ.get("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 CHANNELS = os.environ.get("CHANNELS", "").split(",")
-CHAT_ID = int(os.environ.get("CHAT_ID"))
+CHAT_ID = os.environ.get("CHAT_ID")  # String for validation
 
 # Preset auto-sell targets and stop-loss (as percentages) for new tokens
 PRESET_SELL_TARGETS = [2, 3, 5, 10, 20, 50]
@@ -68,9 +67,13 @@ def load_trades():
     return {}
 
 def save_trades(trades):
-    with trades_lock:
-        with open(TRADES_FILE, "w") as f:
-            json.dump(trades, f, indent=2)
+    try:
+        with trades_lock:
+            with open(TRADES_FILE, "w") as f:
+                json.dump(trades, f, indent=2)
+            logger.info("Trades successfully saved to %s", TRADES_FILE)
+    except Exception as e:
+        logger.error(f"Failed to save trades: {e}")
 
 trades = load_trades()
 
@@ -103,6 +106,9 @@ def get_token_info(mint_str: str):
         mint_info = token.get_mint_info()
         decimals = mint_info.decimals
         total_supply = mint_info.supply / (10 ** decimals)
+        logger.info(f"Fetched mint info for {mint_str}: decimals={decimals}, total_supply={total_supply}")
+
+        # Attempt to fetch metadata
         metadata_program_id = Pubkey.from_string("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s")
         metadata_pda, _ = Pubkey.find_program_address(
             [b"metadata", bytes(metadata_program_id), bytes(mint)],
@@ -110,15 +116,28 @@ def get_token_info(mint_str: str):
         )
         account_info = sol_client.get_account_info(metadata_pda)
         if account_info.value is None:
-            logger.warning(f"No metadata for {mint_str}")
+            logger.warning(f"No metadata found for {mint_str}")
             return {"name": "Unknown", "decimals": decimals, "total_supply": total_supply}
+
         data = account_info.value.data
-        name_len = struct.unpack("<I", data[65:69])[0]
-        name = data[69:69 + name_len].decode("utf-8").rstrip("\x00")
-        return {"name": name, "decimals": decimals, "total_supply": total_supply}
+        if len(data) < 69:
+            logger.warning(f"Metadata for {mint_str} is too short: {len(data)} bytes")
+            return {"name": "Unknown", "decimals": decimals, "total_supply": total_supply}
+
+        try:
+            name_len = struct.unpack("<I", data[65:69])[0]
+            if 69 + name_len > len(data):
+                logger.warning(f"Invalid name length for {mint_str}: name_len={name_len}, data_len={len(data)}")
+                return {"name": "Unknown", "decimals": decimals, "total_supply": total_supply}
+            name = data[69:69 + name_len].decode("utf-8").rstrip("\x00")
+            logger.info(f"Fetched token name for {mint_str}: {name}")
+            return {"name": name, "decimals": decimals, "total_supply": total_supply}
+        except Exception as e:
+            logger.error(f"Failed to parse metadata for {mint_str}: {e}")
+            return {"name": "Unknown", "decimals": decimals, "total_supply": total_supply}
     except Exception as e:
         logger.error(f"Failed to get token info for {mint_str}: {e}")
-        return None
+        return {"name": "Unknown", "decimals": 6, "total_supply": 0}
 
 # ------------------ TELEGRAM BOT ------------------ #
 app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -142,7 +161,6 @@ def get_swap_quote(input_mint, output_mint, amount):
         "outputMint": output_mint,
         "amount": raw_amount,
         "slippageBps": SLIPPAGE_BPS,
-        # --- IMPROVEMENT: Use lowercase string "false" for v6 API ---
         "onlyDirectRoutes": "false",
     }
 
@@ -166,20 +184,18 @@ def execute_swap_route(route, output_mint):
         logger.info("Getting swap transaction from Jupiter API")
         swap_url = f"{JUPITER_API}/swap"
 
-        # ⬇️ This is the only part changed: add the low-fee params
         swap_payload = {
             "quoteResponse": route,
             "userPublicKey": str(payer.pubkey()),
-            "wrapAndUnwrapSol": False,        # cheaper if not swapping SOL
-            "dynamicComputeUnitLimit": True,  # let Jupiter shrink compute usage
-            "prioritizationFeeLamports": 0    # tell Jupiter no priority tip
+            "wrapAndUnwrapSol": False,
+            "dynamicComputeUnitLimit": True,
+            "prioritizationFeeLamports": 0
         }
 
         swap_resp = requests.post(swap_url, json=swap_payload, timeout=20)
         swap_resp.raise_for_status()
         response_json = swap_resp.json()
 
-        # find the base64 transaction in the response
         tx_base64 = response_json.get("swapTransaction") or response_json.get("swap_transaction")
         if not tx_base64:
             logger.error("No swapTransaction in Jupiter /swap response: %s", response_json)
@@ -188,7 +204,6 @@ def execute_swap_route(route, output_mint):
         tx_bytes = base64.b64decode(tx_base64)
         raw_tx = VersionedTransaction.from_bytes(tx_bytes)
 
-        # Sign the versioned message bytes
         try:
             to_sign = to_bytes_versioned(raw_tx.message)
             signature = payer.sign_message(to_sign)
@@ -210,7 +225,6 @@ def execute_swap_route(route, output_mint):
                     logger.error("All signing fallbacks failed: %s", e)
                     return None
 
-        # Send the already-signed, serialized transaction
         opts = TxOpts(skip_preflight=False, preflight_commitment="confirmed")
         resp = sol_client.send_raw_transaction(serialized, opts=opts)
         sig = resp.value
@@ -230,7 +244,6 @@ def execute_swap_route(route, output_mint):
 def fetch_token_price(token_mint):
     logger.info(f"Fetching price for token: {token_mint}")
     quote = get_swap_quote(token_mint, USDC_MINT, 1)
-    # --- IMPROVEMENT: Handle direct quote object from v6 API ---
     if quote and "outAmount" in quote:
         return int(quote["outAmount"]) / (10 ** get_token_decimals(USDC_MINT))
     logger.error(f"No valid price quote for {token_mint}")
@@ -240,11 +253,11 @@ def fetch_token_price(token_mint):
 
 def get_current_info(token):
     current_price = fetch_token_price(token)
-    info = trades[token]
+    info = trades.get(token, {})
     name = info.get("name", "Unknown")
     total_supply = info.get("total_supply", 0)
-    buy_price = info["buy_price"]
-    amount = info["amount"]
+    buy_price = info.get("buy_price", 0)
+    amount = info.get("amount", 0)
     if current_price is None:
         profit_percent = 0
         profit_usd = 0
@@ -303,38 +316,48 @@ async def buy_token(token_mint):
         
         logger.info(f"Got swap quote, executing swap for {token_mint}")
         resp = execute_swap_route(route, token_mint)
-        if resp:
-            logger.info(f"Swap successful for {token_mint}, fetching price")
-            buy_price = fetch_token_price(token_mint)
-            
-            out_amount_base = int(route["outAmount"])
-            token_decimals = get_token_decimals(token_mint)
-            out_amount_human = out_amount_base / (10 ** token_decimals)
+        if not resp:
+            logger.error(f"Swap execution failed for {token_mint}")
+            return
+        
+        logger.info(f"Swap successful for {token_mint}, fetching price")
+        buy_price = fetch_token_price(token_mint)
+        if buy_price is None:
+            logger.error(f"Failed to fetch buy price for {token_mint}. Proceeding with default values.")
+            buy_price = 0  # Default to avoid breaking trade storage
 
-            token_info = get_token_info(token_mint)
-            name = token_info["name"] if token_info else "Unknown"
-            total_supply = token_info["total_supply"] if token_info else 0
-            market_cap = total_supply * buy_price if buy_price and total_supply > 0 else "N/A"
+        out_amount_base = int(route["outAmount"])
+        token_decimals = get_token_decimals(token_mint)
+        out_amount_human = out_amount_base / (10 ** token_decimals)
 
-            trades[token_mint] = {
-                "buy_price": buy_price,
-                "amount": out_amount_human,
-                "targets": PRESET_SELL_TARGETS.copy(),
-                "stop_loss": PRESET_STOP_LOSS[2],
-                "name": name,
-                "total_supply": total_supply,
-            }
-            save_trades(trades)
-            logger.info(
-                f"Bought {out_amount_human} of {token_mint} at {buy_price} USDC "
-                f"with targets {trades[token_mint]['targets']} and stop-loss {trades[token_mint]['stop_loss']}%"
-            )
+        token_info = get_token_info(token_mint)
+        name = token_info["name"] if token_info else "Unknown"
+        total_supply = token_info["total_supply"] if token_info else 0
+        market_cap = total_supply * buy_price if buy_price and total_supply > 0 else "N/A"
 
-            # Send notification
+        trades[token_mint] = {
+            "buy_price": buy_price,
+            "amount": out_amount_human,
+            "targets": PRESET_SELL_TARGETS.copy(),
+            "stop_loss": PRESET_STOP_LOSS[2],
+            "name": name,
+            "total_supply": total_supply,
+        }
+        logger.info(f"Added {token_mint} to trades: {trades[token_mint]}")
+        save_trades(trades)
+        logger.info(
+            f"Bought {out_amount_human} of {token_mint} ({name}) at {buy_price} USDC "
+            f"with targets {trades[token_mint]['targets']} and stop-loss {trades[token_mint]['stop_loss']}%"
+        )
+
+        # Send notification
+        try:
             notif_msg = f"Bought {out_amount_human} {name} ({token_mint}) at {buy_price} USDC each, market cap: {market_cap if isinstance(market_cap, str) else f'{market_cap:.2f}'}"
-            await app.bot.send_message(chat_id=CHAT_ID, text=notif_msg)
-        else:
-            logger.error(f"Swap execution returned None for {token_mint}")
+            await app.bot.send_message(chat_id=int(CHAT_ID), text=notif_msg)
+            logger.info(f"Sent buy notification for {token_mint} to chat {CHAT_ID}")
+        except Exception as e:
+            logger.error(f"Failed to send buy notification for {token_mint}: {e}")
+
     except Exception as e:
         logger.error(f"Buy failed for {token_mint}: {str(e)}")
 
@@ -373,8 +396,12 @@ async def check_auto_sell():
                         logger.info(f"Sold {info['amount']} of {token} for {out_amount_human} USDC at {current_price} (target {target}x)")
 
                         # Send notification
-                        notif_msg = f"Sold {amount} {name} ({token}) for {out_amount_human} USDC (effective price {effective_sell_price}), profit {profit_percent:.2f}% ({profit_usd:.2f} USDC), market cap at sell: {market_cap if isinstance(market_cap, str) else f'{market_cap:.2f}'} (target {target}x)"
-                        await app.bot.send_message(chat_id=CHAT_ID, text=notif_msg)
+                        try:
+                            notif_msg = f"Sold {amount} {name} ({token}) for {out_amount_human} USDC (effective price {effective_sell_price}), profit {profit_percent:.2f}% ({profit_usd:.2f} USDC), market cap at sell: {market_cap if isinstance(market_cap, str) else f'{market_cap:.2f}'} (target {target}x)"
+                            await app.bot.send_message(chat_id=int(CHAT_ID), text=notif_msg)
+                            logger.info(f"Sent sell notification for {token} to chat {CHAT_ID}")
+                        except Exception as e:
+                            logger.error(f"Failed to send sell notification for {token}: {e}")
 
                         to_remove.append(token)
                         break
@@ -399,8 +426,12 @@ async def check_auto_sell():
                     logger.info(f"Sold {info['amount']} of {token} for {out_amount_human} USDC at {current_price} (stop-loss {info['stop_loss']}%)")
 
                     # Send notification
-                    notif_msg = f"Sold {amount} {name} ({token}) for {out_amount_human} USDC (effective price {effective_sell_price}), profit {profit_percent:.2f}% ({profit_usd:.2f} USDC), market cap at sell: {market_cap if isinstance(market_cap, str) else f'{market_cap:.2f}'} (stop-loss {info['stop_loss']}%)"
-                    await app.bot.send_message(chat_id=CHAT_ID, text=notif_msg)
+                    try:
+                        notif_msg = f"Sold {amount} {name} ({token}) for {out_amount_human} USDC (effective price {effective_sell_price}), profit {profit_percent:.2f}% ({profit_usd:.2f} USDC), market cap at sell: {market_cap if isinstance(market_cap, str) else f'{market_cap:.2f}'} (stop-loss {info['stop_loss']}%)"
+                        await app.bot.send_message(chat_id=int(CHAT_ID), text=notif_msg)
+                        logger.info(f"Sent sell notification for {token} to chat {CHAT_ID}")
+                    except Exception as e:
+                        logger.error(f"Failed to send sell notification for {token}: {e}")
 
                     to_remove.append(token)
         except Exception as e:
@@ -529,8 +560,12 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"Manually sold {amount_sold} of {token} for {out_amount_human} USDC")
 
                 # Send notification
-                notif_msg = f"Manually sold {amount} {name} ({token}) for {out_amount_human} USDC (effective price {effective_sell_price}), profit {profit_percent:.2f}% ({profit_usd:.2f} USDC), market cap at sell: {market_cap if isinstance(market_cap, str) else f'{market_cap:.2f}'}"
-                await app.bot.send_message(chat_id=CHAT_ID, text=notif_msg)
+                try:
+                    notif_msg = f"Manually sold {amount} {name} ({token}) for {out_amount_human} USDC (effective price {effective_sell_price}), profit {profit_percent:.2f}% ({profit_usd:.2f} USDC), market cap at sell: {market_cap if isinstance(market_cap, str) else f'{market_cap:.2f}'}"
+                    await app.bot.send_message(chat_id=int(CHAT_ID), text=notif_msg)
+                    logger.info(f"Sent sell notification for {token} to chat {CHAT_ID}")
+                except Exception as e:
+                    logger.error(f"Failed to send sell notification for {token}: {e}")
             else:
                 await update.message.reply_text(f"Failed to sell {token}: Swap rejected or failed")
         else:
@@ -680,6 +715,12 @@ if __name__ == "__main__":
         if not os.environ.get(env):
             logger.error(f"Missing required environment variable: {env}")
             exit(1)
+    try:
+        CHAT_ID = int(CHAT_ID)
+        logger.info(f"CHAT_ID set to {CHAT_ID}")
+    except ValueError:
+        logger.error(f"Invalid CHAT_ID: {CHAT_ID}. Must be a valid integer.")
+        exit(1)
 
     tele_client.start()
     logger.info("Telethon client started")
