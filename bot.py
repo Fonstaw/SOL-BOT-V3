@@ -1,4 +1,3 @@
-# bot.py
 from solders.transaction import VersionedTransaction
 from solders.message import to_bytes_versioned
 from solders.signature import Signature
@@ -11,6 +10,7 @@ import base64
 import requests
 import re
 import threading
+import struct
 from tenacity import retry, stop_after_attempt, wait_exponential
 from flask import Flask
 from telethon import TelegramClient, events
@@ -41,7 +41,7 @@ SOLANA_RPC = os.environ.get("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
 JUPITER_API = os.environ.get("JUPITER_API", "https://quote-api.jup.ag/v6")
 USDC_MINT = os.environ.get("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 CHANNELS = os.environ.get("CHANNELS", "").split(",")
-CHAT_ID = int(os.environ.get("CHAT_ID"))  # Your Telegram user ID for notifications
+CHAT_ID = int(os.environ.get("CHAT_ID"))
 
 # Preset auto-sell targets and stop-loss (as percentages) for new tokens
 PRESET_SELL_TARGETS = [2, 3, 5, 10, 20, 50]
@@ -96,40 +96,29 @@ def get_token_decimals(mint: str) -> int:
         logger.error(f"Failed to fetch decimals for {mint}: {e}")
         return 6
 
-def get_token_ticker(mint: str) -> str:
+def get_token_info(mint_str: str):
     try:
-        metadata_program = Pubkey.from_string("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s")
-        mint_pubkey = Pubkey.from_string(mint)
-        metadata_pda = Pubkey.find_program_address([b"metadata", metadata_program.to_bytes(), mint_pubkey.to_bytes()], metadata_program)[0]
+        mint = Pubkey.from_string(mint_str)
+        token = Token(sol_client, mint, TOKEN_PROGRAM_ID, payer)
+        mint_info = token.get_mint_info()
+        decimals = mint_info.decimals
+        total_supply = mint_info.supply / (10 ** decimals)
+        metadata_program_id = Pubkey.from_string("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s")
+        metadata_pda, _ = Pubkey.find_program_address(
+            [b"metadata", bytes(metadata_program_id), bytes(mint)],
+            metadata_program_id
+        )
         account_info = sol_client.get_account_info(metadata_pda)
-        if account_info.value:
-            data = account_info.value.data
-            # Name length at 32-36, name at 36+
-            name_length = int.from_bytes(data[32:36], "little")
-            symbol_offset = 36 + name_length + 4  # Skip name and symbol length
-            symbol_length = int.from_bytes(data[36 + name_length:36 + name_length + 4], "little")
-            symbol = data[symbol_offset:symbol_offset + symbol_length].decode('utf-8').strip('\x00')
-            return symbol or "UNK"
-        return "UNK"
+        if account_info.value is None:
+            logger.warning(f"No metadata for {mint_str}")
+            return {"name": "Unknown", "decimals": decimals, "total_supply": total_supply}
+        data = account_info.value.data
+        name_len = struct.unpack("<I", data[65:69])[0]
+        name = data[69:69 + name_len].decode("utf-8").rstrip("\x00")
+        return {"name": name, "decimals": decimals, "total_supply": total_supply}
     except Exception as e:
-        logger.error(f"Metadata fetch failed for mint {mint}")
-        return "UNK"
-
-def get_market_cap(token_mint: str, price: float) -> str:
-    try:
-        mint_pubkey = Pubkey.from_string(token_mint)
-        token = Token(sol_client, mint_pubkey, TOKEN_PROGRAM_ID, payer)
-        supply = token.get_mint_info().supply
-        decimals = get_token_decimals(token_mint)
-        total_tokens = supply / (10 ** decimals)
-        mc = total_tokens * price
-        return f"${mc:,.2f}"
-    except Exception as e:
-        logger.error(f"Failed to calculate market cap for {token_mint}: {e}")
-        return "N/A"
-
-def shorten_mint(mint: str) -> str:
-    return f"{mint[:8]}...{mint[-8:]}"
+        logger.error(f"Failed to get token info for {mint_str}: {e}")
+        return None
 
 # ------------------ TELEGRAM BOT ------------------ #
 app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -140,6 +129,7 @@ tele_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 logger.info("Telethon client initialized")
 
 # ------------------ JUPITER FUNCTIONS ------------------ #
+
 @retry(stop=stop_after_attempt(MAX_RETRIES), wait=wait_exponential(multiplier=1, min=2, max=10))
 def get_swap_quote(input_mint, output_mint, amount):
     logger.info(f"Getting swap quote: input={input_mint}, output={output_mint}, amount={amount}, slippage={SLIPPAGE_BPS}")
@@ -240,12 +230,59 @@ def execute_swap_route(route, output_mint):
 def fetch_token_price(token_mint):
     logger.info(f"Fetching price for token: {token_mint}")
     quote = get_swap_quote(token_mint, USDC_MINT, 1)
+    # --- IMPROVEMENT: Handle direct quote object from v6 API ---
     if quote and "outAmount" in quote:
         return int(quote["outAmount"]) / (10 ** get_token_decimals(USDC_MINT))
     logger.error(f"No valid price quote for {token_mint}")
     return None
 
+# ------------------ HELPER FUNCTIONS ------------------ #
+
+def get_current_info(token):
+    current_price = fetch_token_price(token)
+    info = trades[token]
+    name = info.get("name", "Unknown")
+    total_supply = info.get("total_supply", 0)
+    buy_price = info["buy_price"]
+    amount = info["amount"]
+    if current_price is None:
+        profit_percent = 0
+        profit_usd = 0
+        market_cap = "N/A"
+        current_price = "N/A"
+    else:
+        profit_percent = ((current_price - buy_price) / buy_price * 100) if buy_price > 0 else 0
+        profit_usd = (current_price - buy_price) * amount
+        market_cap = total_supply * current_price if total_supply > 0 else "N/A"
+    return name, current_price, profit_percent, profit_usd, market_cap
+
+def get_status_content():
+    msg = f"Auto-buy: {AUTO_BUY}\nTrade amount: {TRADE_AMOUNT_USDC} USDC\nSlippage: {SLIPPAGE_BPS/100}%\nChannels: {CHANNELS}\nPreset Sell Targets: {PRESET_SELL_TARGETS}\nPreset Stop-Loss: {[f'{x}%' for x in PRESET_STOP_LOSS]}\n\nTracked Tokens:\n"
+    for token, info in trades.items():
+        short_addr = f"{token[:6]}...{token[-6:]}"
+        name, current_price, profit_percent, profit_usd, market_cap = get_current_info(token)
+        msg += f"{name} ({short_addr}): {info['amount']} tokens bought at {info['buy_price']}, P/L: {profit_percent:.2f}% ({profit_usd:.2f} USDC), MC: {market_cap if isinstance(market_cap, str) else f'{market_cap:.2f}'}\n"
+    keyboard = [
+        [InlineKeyboardButton("Toggle Auto-Buy", callback_data="togglebuy"), InlineKeyboardButton("Set Amount", callback_data="setamount")],
+        [InlineKeyboardButton("Add Channel", callback_data="addchannel"), InlineKeyboardButton("Remove Channel", callback_data="removechannel")],
+        [InlineKeyboardButton("View Trades", callback_data="viewtrades"), InlineKeyboardButton("Change Wallet", callback_data="setwallet")],
+        [InlineKeyboardButton("Set Targets", callback_data="settargets"), InlineKeyboardButton("Set Stop-Loss", callback_data="setstoploss")],
+        [InlineKeyboardButton("Sell Token", callback_data="sell"), InlineKeyboardButton("Set Slippage", callback_data="setslippage")],
+        [InlineKeyboardButton("Set Preset Targets", callback_data="setpresettargets"), InlineKeyboardButton("Set Preset Stop-Loss", callback_data="setpresetstoploss")],
+        [InlineKeyboardButton("Refresh Status", callback_data="refreshstatus")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    return msg, reply_markup
+
+def get_viewtrades_msg():
+    msg = "Tracked Tokens:\n"
+    for token, info in trades.items():
+        name, current_price, _, _, market_cap = get_current_info(token)
+        msg += f"Token: {name} ({token})\nAmount: {info['amount']}\nBuy Price: {info['buy_price']}\nCurrent Price: {current_price}\nMarket Cap: {market_cap if isinstance(market_cap, str) else f'{market_cap:.2f}'}\n\n"
+    return msg or "No trades yet"
+
 # ------------------ TRADE LOGIC ------------------ #
+
 async def buy_token(token_mint):
     global trades
     logger.info(f"Attempting to buy token: {token_mint}")
@@ -262,7 +299,6 @@ async def buy_token(token_mint):
             logger.error(f"No swap quote returned for {token_mint}. Skipping buy.")
             return
         
-        # The quote object is the route itself in v6
         route = quote
         
         logger.info(f"Got swap quote, executing swap for {token_mint}")
@@ -275,24 +311,28 @@ async def buy_token(token_mint):
             token_decimals = get_token_decimals(token_mint)
             out_amount_human = out_amount_base / (10 ** token_decimals)
 
-            ticker = get_token_ticker(token_mint)
-            mc = get_market_cap(token_mint, buy_price)
-            sig = resp.value
-            await app.bot.send_message(chat_id=CHAT_ID, text=f"🟢 Bought {out_amount_human} {ticker} ✅\n🔴 Market Cap {mc}\n💲 Amount Spent {TRADE_AMOUNT_USDC}\n🔗 https://solscan.io/tx/{sig}")
+            token_info = get_token_info(token_mint)
+            name = token_info["name"] if token_info else "Unknown"
+            total_supply = token_info["total_supply"] if token_info else 0
+            market_cap = total_supply * buy_price if buy_price and total_supply > 0 else "N/A"
 
             trades[token_mint] = {
                 "buy_price": buy_price,
                 "amount": out_amount_human,
                 "targets": PRESET_SELL_TARGETS.copy(),
                 "stop_loss": PRESET_STOP_LOSS[2],
-                "symbol": ticker,
-                "current_price": buy_price,
+                "name": name,
+                "total_supply": total_supply,
             }
             save_trades(trades)
             logger.info(
                 f"Bought {out_amount_human} of {token_mint} at {buy_price} USDC "
                 f"with targets {trades[token_mint]['targets']} and stop-loss {trades[token_mint]['stop_loss']}%"
             )
+
+            # Send notification
+            notif_msg = f"Bought {out_amount_human} {name} ({token_mint}) at {buy_price} USDC each, market cap: {market_cap if isinstance(market_cap, str) else f'{market_cap:.2f}'}"
+            await app.bot.send_message(chat_id=CHAT_ID, text=notif_msg)
         else:
             logger.error(f"Swap execution returned None for {token_mint}")
     except Exception as e:
@@ -307,8 +347,12 @@ async def check_auto_sell():
             if current_price is None:
                 continue
 
-            # Update cache
-            trades[token]["current_price"] = current_price
+            name = info.get("name", "Unknown")
+            total_supply = info.get("total_supply", 0)
+            market_cap = total_supply * current_price if total_supply > 0 else "N/A"
+            amount = info["amount"]
+            buy_price = info["buy_price"]
+            buy_cost = buy_price * amount
 
             # Check take-profit targets
             for target in info["targets"]:
@@ -323,15 +367,15 @@ async def check_auto_sell():
                         out_amount_base = int(route["outAmount"])
                         usdc_decimals = get_token_decimals(USDC_MINT)
                         out_amount_human = out_amount_base / (10 ** usdc_decimals)
-                        percent_change = ((current_price - info["buy_price"]) / info["buy_price"]) * 100
-                        usdc_change = (current_price - info["buy_price"]) * info["amount"]
-                        change_str = f"{percent_change:+.2f}% ({usdc_change:+.2f}$)"
-                        ticker = info.get("symbol", "UNK")
-                        mc = get_market_cap(token, current_price)
-                        sig = resp.value
-                        await app.bot.send_message(chat_id=CHAT_ID, text=f"🔴 Sold {info['amount']} {ticker}\n⚪ Market Cap {mc}\n💲 Amount gotten {out_amount_human}\n📈 Profit/Loss: {change_str}\n🔗 https://solscan.io/tx/{sig}")
-
+                        effective_sell_price = out_amount_human / amount if amount > 0 else 0
+                        profit_usd = out_amount_human - buy_cost
+                        profit_percent = (profit_usd / buy_cost * 100) if buy_cost > 0 else 0
                         logger.info(f"Sold {info['amount']} of {token} for {out_amount_human} USDC at {current_price} (target {target}x)")
+
+                        # Send notification
+                        notif_msg = f"Sold {amount} {name} ({token}) for {out_amount_human} USDC (effective price {effective_sell_price}), profit {profit_percent:.2f}% ({profit_usd:.2f} USDC), market cap at sell: {market_cap if isinstance(market_cap, str) else f'{market_cap:.2f}'} (target {target}x)"
+                        await app.bot.send_message(chat_id=CHAT_ID, text=notif_msg)
+
                         to_remove.append(token)
                         break
             
@@ -349,15 +393,15 @@ async def check_auto_sell():
                     out_amount_base = int(route["outAmount"])
                     usdc_decimals = get_token_decimals(USDC_MINT)
                     out_amount_human = out_amount_base / (10 ** usdc_decimals)
-                    percent_change = ((current_price - info["buy_price"]) / info["buy_price"]) * 100
-                    usdc_change = (current_price - info["buy_price"]) * info["amount"]
-                    change_str = f"{percent_change:+.2f}% ({usdc_change:+.2f}$)"
-                    ticker = info.get("symbol", "UNK")
-                    mc = get_market_cap(token, current_price)
-                    sig = resp.value
-                    await app.bot.send_message(chat_id=CHAT_ID, text=f"🔴 Sold {info['amount']} {ticker}\n⚪ Market Cap {mc}\n💲 Amount gotten {out_amount_human}\n📈 Profit/Loss: {change_str}\n🔗 https://solscan.io/tx/{sig}")
-
+                    effective_sell_price = out_amount_human / amount if amount > 0 else 0
+                    profit_usd = out_amount_human - buy_cost
+                    profit_percent = (profit_usd / buy_cost * 100) if buy_cost > 0 else 0
                     logger.info(f"Sold {info['amount']} of {token} for {out_amount_human} USDC at {current_price} (stop-loss {info['stop_loss']}%)")
+
+                    # Send notification
+                    notif_msg = f"Sold {amount} {name} ({token}) for {out_amount_human} USDC (effective price {effective_sell_price}), profit {profit_percent:.2f}% ({profit_usd:.2f} USDC), market cap at sell: {market_cap if isinstance(market_cap, str) else f'{market_cap:.2f}'} (stop-loss {info['stop_loss']}%)"
+                    await app.bot.send_message(chat_id=CHAT_ID, text=notif_msg)
+
                     to_remove.append(token)
         except Exception as e:
             logger.error(f"Auto-sell error for {token}: {e}")
@@ -365,52 +409,22 @@ async def check_auto_sell():
         if token in trades: trades.pop(token)
     save_trades(trades)
 
-async def update_prices():
-    for token in trades.keys():
-        current_price = fetch_token_price(token)
-        if current_price is not None:
-            trades[token]["current_price"] = current_price
-    save_trades(trades)
-
 async def auto_sell_loop():
     logger.info("Starting auto-sell loop")
     while True:
         await check_auto_sell()
-        await update_prices()
         await asyncio.sleep(60)
 
 # ------------------ TELEGRAM COMMANDS ------------------ #
-def generate_status_msg():
-    msg = f"Auto-buy: {AUTO_BUY}\nTrade amount: {TRADE_AMOUNT_USDC} USDC\nSlippage: {SLIPPAGE_BPS/100}%\nChannels: {CHANNELS}\nPreset Sell Targets: {PRESET_SELL_TARGETS}\nPreset Stop-Loss: {[f'{x}%' for x in PRESET_STOP_LOSS]}\n\nTracked Tokens:\n"
-    for token, info in trades.items():
-        ticker = info.get("symbol", "UNK")
-        shortened_ca = shorten_mint(token)
-        current_price = info.get("current_price")
-        if current_price is not None:
-            percent_change = ((current_price - info["buy_price"]) / info["buy_price"]) * 100
-            usdc_change = (current_price - info["buy_price"]) * info["amount"]
-            emoji = "🟢" if percent_change > 0 else "🔴"
-            change_str = f" ({percent_change:+.2f}%) ({usdc_change:+.2f}$)"
-        else:
-            emoji = ""
-            change_str = " (N/A) (N/A)"
-        msg += f"⚪ {ticker} ({shortened_ca})\n{emoji}{change_str} Buy {info['amount']} tokens at {info['buy_price']}, Targets {info['targets']}, Stop-loss {info['stop_loss']}%\n"
-    return msg
-
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received /status command")
-    msg = generate_status_msg()
-    keyboard = [
-        [InlineKeyboardButton("Toggle Auto-Buy", callback_data="togglebuy"), InlineKeyboardButton("Set Amount", callback_data="setamount")],
-        [InlineKeyboardButton("Add Channel", callback_data="addchannel"), InlineKeyboardButton("Remove Channel", callback_data="removechannel")],
-        [InlineKeyboardButton("View Trades", callback_data="viewtrades"), InlineKeyboardButton("Change Wallet", callback_data="setwallet")],
-        [InlineKeyboardButton("Set Targets", callback_data="settargets"), InlineKeyboardButton("Set Stop-Loss", callback_data="setstoploss")],
-        [InlineKeyboardButton("Sell Token", callback_data="sell"), InlineKeyboardButton("Set Slippage", callback_data="setslippage")],
-        [InlineKeyboardButton("Set Preset Targets", callback_data="setpresettargets"), InlineKeyboardButton("Set Preset Stop-Loss", callback_data="setpresetstoploss")],
-        [InlineKeyboardButton("Refresh", callback_data="refresh")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    msg, reply_markup = get_status_content()
     await update.message.reply_text(msg, reply_markup=reply_markup)
+
+async def viewtrades(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("Received /viewtrades command")
+    msg = get_viewtrades_msg()
+    await update.message.reply_text(msg)
 
 async def setamount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received /setamount command")
@@ -488,7 +502,15 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token = context.args[0]
         if token in trades:
             info = trades[token]
-            quote = get_swap_quote(token, USDC_MINT, info["amount"])
+            name = info.get("name", "Unknown")
+            total_supply = info.get("total_supply", 0)
+            amount = info["amount"]
+            buy_price = info["buy_price"]
+            buy_cost = buy_price * amount
+            current_price = fetch_token_price(token)
+            market_cap = total_supply * current_price if current_price and total_supply > 0 else "N/A"
+
+            quote = get_swap_quote(token, USDC_MINT, trades[token]["amount"])
             if not quote:
                 await update.message.reply_text(f"Could not get a quote to sell {token}")
                 return
@@ -498,19 +520,17 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 out_amount_base = int(route["outAmount"])
                 usdc_decimals = get_token_decimals(USDC_MINT)
                 out_amount_human = out_amount_base / (10 ** usdc_decimals)
-                current_price = fetch_token_price(token)
-                percent_change = ((current_price - info["buy_price"]) / info["buy_price"]) * 100 if current_price else 0
-                usdc_change = (current_price - info["buy_price"]) * info["amount"] if current_price else 0
-                change_str = f"{percent_change:+.2f}% ({usdc_change:+.2f}$)"
-                ticker = info.get("symbol", "UNK")
-                mc = get_market_cap(token, current_price) if current_price else "N/A"
-                sig = resp.value
-                await app.bot.send_message(chat_id=CHAT_ID, text=f"🔴 Sold {info['amount']} {ticker}\n⚪ Market Cap {mc}\n💲 Amount gotten {out_amount_human}\n📈 Profit/Loss: {change_str}\n🔗 https://solscan.io/tx/{sig}")
-
-                amount_sold = info['amount']
+                effective_sell_price = out_amount_human / amount if amount > 0 else 0
+                profit_usd = out_amount_human - buy_cost
+                profit_percent = (profit_usd / buy_cost * 100) if buy_cost > 0 else 0
+                amount_sold = trades[token]['amount']
                 trades.pop(token)
                 save_trades(trades)
                 await update.message.reply_text(f"Manually sold {amount_sold} of {token} for {out_amount_human} USDC")
+
+                # Send notification
+                notif_msg = f"Manually sold {amount} {name} ({token}) for {out_amount_human} USDC (effective price {effective_sell_price}), profit {profit_percent:.2f}% ({profit_usd:.2f} USDC), market cap at sell: {market_cap if isinstance(market_cap, str) else f'{market_cap:.2f}'}"
+                await app.bot.send_message(chat_id=CHAT_ID, text=notif_msg)
             else:
                 await update.message.reply_text(f"Failed to sell {token}: Swap rejected or failed")
         else:
@@ -581,12 +601,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "removechannel":
         await query.message.reply_text("Send /removechannel @channelname to remove a channel")
     elif query.data == "viewtrades":
-        msg = "Tracked Tokens:\n"
-        for token, info in trades.items():
-            ticker = info.get("symbol", "UNK")
-            mc = get_market_cap(token, info.get("current_price", info["buy_price"]))
-            msg += f"{ticker} ({token})\nAmount: {info['amount']} tokens\nBuy Price: {info['buy_price']} USDC\nMarket Cap: {mc}\n\n"
-        await query.message.reply_text(msg or "No trades yet")
+        msg = get_viewtrades_msg()
+        await query.message.reply_text(msg)
     elif query.data == "setwallet":
         await query.message.reply_text("Send /setwallet <128-char-hex-key> to change wallet")
     elif query.data == "settargets":
@@ -601,13 +617,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Send /setpresettargets <x1,x2,...> to set preset sell targets")
     elif query.data == "setpresetstoploss":
         await query.message.reply_text("Send /setpresetstoploss <x1,x2,...> to set preset stop-loss")
-    elif query.data == "refresh":
-        msg = generate_status_msg()
-        keyboard = query.message.reply_markup.inline_keyboard
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(text=msg, reply_markup=reply_markup)
+    elif query.data == "refreshstatus":
+        msg, reply_markup = get_status_content()
+        await query.edit_message_text(msg, reply_markup=reply_markup)
 
 app.add_handler(CommandHandler("status", status))
+app.add_handler(CommandHandler("viewtrades", viewtrades))
 app.add_handler(CommandHandler("setamount", setamount))
 app.add_handler(CommandHandler("settargets", settargets))
 app.add_handler(CommandHandler("setstoploss", setstoploss))
