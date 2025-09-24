@@ -40,6 +40,7 @@ SOLANA_RPC = os.environ.get("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
 JUPITER_API = os.environ.get("JUPITER_API", "https://quote-api.jup.ag/v6")
 USDC_MINT = os.environ.get("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 CHANNELS = os.environ.get("CHANNELS", "").split(",")
+CHAT_ID = int(os.environ.get("CHAT_ID"))  # Your Telegram user ID for notifications
 
 # Preset auto-sell targets and stop-loss (as percentages) for new tokens
 PRESET_SELL_TARGETS = [2, 3, 5, 10, 20, 50]
@@ -94,6 +95,41 @@ def get_token_decimals(mint: str) -> int:
         logger.error(f"Failed to fetch decimals for {mint}: {e}")
         return 6
 
+def get_token_ticker(mint: str) -> str:
+    try:
+        metadata_program = Pubkey.from_string("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s")
+        mint_pubkey = Pubkey.from_string(mint)
+        metadata_pda = Pubkey.find_program_address([b"metadata", metadata_program.to_bytes(), mint_pubkey.to_bytes()], metadata_program)[0]
+        account_info = sol_client.get_account_info(metadata_pda)
+        if account_info.value:
+            data = account_info.value.data
+            # Name length at 32-36, name at 36+
+            name_length = int.from_bytes(data[32:36], "little")
+            symbol_offset = 36 + name_length + 4  # Skip name and symbol length
+            symbol_length = int.from_bytes(data[36 + name_length:36 + name_length + 4], "little")
+            symbol = data[symbol_offset:symbol_offset + symbol_length].decode('utf-8').strip('\x00')
+            return symbol or "UNK"
+        return "UNK"
+    except Exception as e:
+        logger.error(f"Metadata fetch failed for mint {mint}")
+        return "UNK"
+
+def get_market_cap(token_mint: str, price: float) -> str:
+    try:
+        mint_pubkey = Pubkey.from_string(token_mint)
+        token = Token(sol_client, mint_pubkey, TOKEN_PROGRAM_ID, payer)
+        supply = token.get_mint_info().supply
+        decimals = get_token_decimals(token_mint)
+        total_tokens = supply / (10 ** decimals)
+        mc = total_tokens * price
+        return f"${mc:,.2f}"
+    except Exception as e:
+        logger.error(f"Failed to calculate market cap for {token_mint}: {e}")
+        return "N/A"
+
+def shorten_mint(mint: str) -> str:
+    return f"{mint[:8]}...{mint[-8:]}"
+
 # ------------------ TELEGRAM BOT ------------------ #
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 logger.info("Telegram bot application initialized")
@@ -131,64 +167,78 @@ def get_swap_quote(input_mint, output_mint, amount):
         return None
 
 def execute_swap_route(route, output_mint):
+    """
+    route = the quote response you passed to /swap (Jupiter's v6)
+    returns solana-py response (or None on failure)
+    """
     try:
         logger.info("Getting swap transaction from Jupiter API")
         swap_url = f"{JUPITER_API}/swap"
+
+        # ⬇️ This is the only part changed: add the low-fee params
         swap_payload = {
             "quoteResponse": route,
             "userPublicKey": str(payer.pubkey()),
-            "wrapAndUnwrapSol": True,
+            "wrapAndUnwrapSol": False,        # cheaper if not swapping SOL
+            "dynamicComputeUnitLimit": True,  # let Jupiter shrink compute usage
+            "prioritizationFeeLamports": 0    # tell Jupiter no priority tip
         }
-        swap_resp = requests.post(swap_url, json=swap_payload)
+
+        swap_resp = requests.post(swap_url, json=swap_payload, timeout=20)
         swap_resp.raise_for_status()
-        
         response_json = swap_resp.json()
-        tx_base64 = response_json.get("swapTransaction")
-        
+
+        # find the base64 transaction in the response
+        tx_base64 = response_json.get("swapTransaction") or response_json.get("swap_transaction")
         if not tx_base64:
-            logger.error(f"Failed to get swapTransaction from Jupiter API: {response_json}")
+            logger.error("No swapTransaction in Jupiter /swap response: %s", response_json)
             return None
 
-        logger.info("Decoding transaction bytes")
         tx_bytes = base64.b64decode(tx_base64)
-        
-        # This is the raw, unsigned transaction from Jupiter
         raw_tx = VersionedTransaction.from_bytes(tx_bytes)
 
-        # --- THE CORRECT SIGNING AND SENDING WORKFLOW ---
+        # Sign the versioned message bytes
+        try:
+            to_sign = to_bytes_versioned(raw_tx.message)
+            signature = payer.sign_message(to_sign)
+            signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
+            serialized = bytes(signed_tx)
+        except Exception as sign_exc:
+            logger.warning("Primary signing method failed (%s), trying alternate signing paths", sign_exc)
+            if hasattr(raw_tx, "create_signatures"):
+                sigs = raw_tx.create_signatures([payer])
+                raw_tx.set_signatures(sigs)
+                serialized = bytes(raw_tx)
+            else:
+                try:
+                    resp = sol_client.send_transaction(raw_tx, payer,
+                        opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed"))
+                    logger.info("Sent via send_transaction fallback, resp: %s", resp)
+                    return resp
+                except Exception as e:
+                    logger.error("All signing fallbacks failed: %s", e)
+                    return None
 
-        # 1. Get the canonical message bytes to sign
-        message_to_sign = to_bytes_versioned(raw_tx.message)
-
-        # 2. Sign the message bytes with your keypair to create a signature
-        signature = payer.sign_message(message_to_sign)
-
-        # 3. Create a new, signed transaction by populating the raw transaction with the signature
-        signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
-
-        # 4. Serialize the signed transaction to send as a raw blob
-        serialized_tx = bytes(signed_tx)
-
-        logger.info("Sending signed raw transaction")
-        # 5. Send as a raw transaction for maximum compatibility
+        # Send the already-signed, serialized transaction
         opts = TxOpts(skip_preflight=False, preflight_commitment="confirmed")
-        resp = sol_client.send_raw_transaction(serialized_tx, opts=opts)
-        
+        resp = sol_client.send_raw_transaction(serialized, opts=opts)
         sig = resp.value
-        
-        logger.info(f"Transaction signature: {sig}")
+        logger.info("Transaction signature: %s", sig)
         sol_client.confirm_transaction(sig, commitment="confirmed")
-        logger.info(f"Transaction confirmed: https://solscan.io/tx/{sig}")
+        logger.info("Transaction confirmed: https://solscan.io/tx/%s", sig)
         return resp
+
+    except requests.exceptions.RequestException as re:
+        logger.error("HTTP error talking to Jupiter swap: %s", re)
+        return None
     except Exception as e:
-        logger.error(f"Swap execution failed: {e}")
+        logger.exception("Swap execution failed: %s", e)
         return None
 
 @retry(stop=stop_after_attempt(MAX_RETRIES), wait=wait_exponential(multiplier=1, min=2, max=10))
 def fetch_token_price(token_mint):
     logger.info(f"Fetching price for token: {token_mint}")
     quote = get_swap_quote(token_mint, USDC_MINT, 1)
-    # --- IMPROVEMENT: Handle direct quote object from v6 API ---
     if quote and "outAmount" in quote:
         return int(quote["outAmount"]) / (10 ** get_token_decimals(USDC_MINT))
     logger.error(f"No valid price quote for {token_mint}")
@@ -207,7 +257,6 @@ async def buy_token(token_mint):
     try:
         logger.info(f"Fetching swap quote for {token_mint} with {TRADE_AMOUNT_USDC} USDC")
         quote = get_swap_quote(USDC_MINT, token_mint, TRADE_AMOUNT_USDC)
-        # --- IMPROVEMENT: Handle direct quote object from v6 API ---
         if not quote:
             logger.error(f"No swap quote returned for {token_mint}. Skipping buy.")
             return
@@ -216,7 +265,7 @@ async def buy_token(token_mint):
         route = quote
         
         logger.info(f"Got swap quote, executing swap for {token_mint}")
-        resp = execute_swap_route(route, token_mint)
+        resp = execute_swap_route(route, token_mint)  # Updated to return only resp
         if resp:
             logger.info(f"Swap successful for {token_mint}, fetching price")
             buy_price = fetch_token_price(token_mint)
@@ -225,11 +274,18 @@ async def buy_token(token_mint):
             token_decimals = get_token_decimals(token_mint)
             out_amount_human = out_amount_base / (10 ** token_decimals)
 
+            ticker = get_token_ticker(token_mint)
+            mc = get_market_cap(token_mint, buy_price)
+            sig = resp.value  # Extract signature from resp
+            await app.bot.send_message(chat_id=CHAT_ID, text=f"🟢 Bought {out_amount_human} {ticker} ✅\n🔴 Market Cap {mc}\n💲 Amount Spent {TRADE_AMOUNT_USDC}\n🔗 https://solscan.io/tx/{sig}")
+
             trades[token_mint] = {
                 "buy_price": buy_price,
                 "amount": out_amount_human,
                 "targets": PRESET_SELL_TARGETS.copy(),
                 "stop_loss": PRESET_STOP_LOSS[2],
+                "symbol": ticker,
+                "current_price": buy_price,  # Initial cache
             }
             save_trades(trades)
             logger.info(
@@ -250,20 +306,30 @@ async def check_auto_sell():
             if current_price is None:
                 continue
 
+            # Update cache
+            trades[token]["current_price"] = current_price
+
             # Check take-profit targets
             for target in info["targets"]:
                 if current_price >= info["buy_price"] * target:
                     quote = get_swap_quote(token, USDC_MINT, info["amount"])
-                    # --- IMPROVEMENT: Handle direct quote object from v6 API ---
                     if not quote:
                         logger.error(f"Could not get sell quote for {token}")
                         continue
                     route = quote
-                    resp = execute_swap_route(route, USDC_MINT)
+                    resp = execute_swap_route(route, USDC_MINT)  # Updated to return only resp
                     if resp:
                         out_amount_base = int(route["outAmount"])
                         usdc_decimals = get_token_decimals(USDC_MINT)
                         out_amount_human = out_amount_base / (10 ** usdc_decimals)
+                        percent_change = ((current_price - info["buy_price"]) / info["buy_price"]) * 100
+                        usdc_change = (current_price - info["buy_price"]) * info["amount"]
+                        change_str = f"{percent_change:+.2f}% ({usdc_change:+.2f}$)"
+                        ticker = info.get("symbol", "UNK")
+                        mc = get_market_cap(token, current_price)
+                        sig = resp.value  # Extract signature from resp
+                        await app.bot.send_message(chat_id=CHAT_ID, text=f"🔴 Sold {info['amount']} {ticker}\n⚪ Market Cap {mc}\n💲 Amount gotten {out_amount_human}\n📈 Profit/Loss: {change_str}\n🔗 https://solscan.io/tx/{sig}")
+
                         logger.info(f"Sold {info['amount']} of {token} for {out_amount_human} USDC at {current_price} (target {target}x)")
                         to_remove.append(token)
                         break
@@ -273,16 +339,23 @@ async def check_auto_sell():
             # Check stop-loss
             if current_price <= info["buy_price"] * (1 - info["stop_loss"] / 100):
                 quote = get_swap_quote(token, USDC_MINT, info["amount"])
-                # --- IMPROVEMENT: Handle direct quote object from v6 API ---
                 if not quote:
                     logger.error(f"Could not get sell quote for {token} (stop-loss)")
                     continue
                 route = quote
-                resp = execute_swap_route(route, USDC_MINT)
+                resp = execute_swap_route(route, USDC_MINT)  # Updated to return only resp
                 if resp:
                     out_amount_base = int(route["outAmount"])
                     usdc_decimals = get_token_decimals(USDC_MINT)
                     out_amount_human = out_amount_base / (10 ** usdc_decimals)
+                    percent_change = ((current_price - info["buy_price"]) / info["buy_price"]) * 100
+                    usdc_change = (current_price - info["buy_price"]) * info["amount"]
+                    change_str = f"{percent_change:+.2f}% ({usdc_change:+.2f}$)"
+                    ticker = info.get("symbol", "UNK")
+                    mc = get_market_cap(token, current_price)
+                    sig = resp.value  # Extract signature from resp
+                    await app.bot.send_message(chat_id=CHAT_ID, text=f"🔴 Sold {info['amount']} {ticker}\n⚪ Market Cap {mc}\n💲 Amount gotten {out_amount_human}\n📈 Profit/Loss: {change_str}\n🔗 https://solscan.io/tx/{sig}")
+
                     logger.info(f"Sold {info['amount']} of {token} for {out_amount_human} USDC at {current_price} (stop-loss {info['stop_loss']}%)")
                     to_remove.append(token)
         except Exception as e:
@@ -291,18 +364,41 @@ async def check_auto_sell():
         if token in trades: trades.pop(token)
     save_trades(trades)
 
+async def update_prices():
+    for token in trades.keys():
+        current_price = fetch_token_price(token)
+        if current_price is not None:
+            trades[token]["current_price"] = current_price
+    save_trades(trades)
+
 async def auto_sell_loop():
     logger.info("Starting auto-sell loop")
     while True:
         await check_auto_sell()
+        await update_prices()  # Update cached prices every 60s
         await asyncio.sleep(60)
 
 # ------------------ TELEGRAM COMMANDS ------------------ #
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info("Received /status command")
+def generate_status_msg():
     msg = f"Auto-buy: {AUTO_BUY}\nTrade amount: {TRADE_AMOUNT_USDC} USDC\nSlippage: {SLIPPAGE_BPS/100}%\nChannels: {CHANNELS}\nPreset Sell Targets: {PRESET_SELL_TARGETS}\nPreset Stop-Loss: {[f'{x}%' for x in PRESET_STOP_LOSS]}\n\nTracked Tokens:\n"
     for token, info in trades.items():
-        msg += f"{token}: Buy {info['amount']} tokens at {info['buy_price']}, Targets {info['targets']}, Stop-loss {info['stop_loss']}%\n"
+        ticker = info.get("symbol", "UNK")
+        shortened_ca = shorten_mint(token)
+        current_price = info.get("current_price")
+        if current_price is not None:
+            percent_change = ((current_price - info["buy_price"]) / info["buy_price"]) * 100
+            usdc_change = (current_price - info["buy_price"]) * info["amount"]
+            emoji = "🟢" if percent_change > 0 else "🔴"
+            change_str = f" ({percent_change:+.2f}%) ({usdc_change:+.2f}$)"
+        else:
+            emoji = ""
+            change_str = " (N/A) (N/A)"
+        msg += f"⚪ {ticker} ({shortened_ca})\n{emoji}{change_str} Buy {info['amount']} tokens at {info['buy_price']}, Targets {info['targets']}, Stop-loss {info['stop_loss']}%\n"
+    return msg
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("Received /status command")
+    msg = generate_status_msg()
     keyboard = [
         [InlineKeyboardButton("Toggle Auto-Buy", callback_data="togglebuy"), InlineKeyboardButton("Set Amount", callback_data="setamount")],
         [InlineKeyboardButton("Add Channel", callback_data="addchannel"), InlineKeyboardButton("Remove Channel", callback_data="removechannel")],
@@ -310,6 +406,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("Set Targets", callback_data="settargets"), InlineKeyboardButton("Set Stop-Loss", callback_data="setstoploss")],
         [InlineKeyboardButton("Sell Token", callback_data="sell"), InlineKeyboardButton("Set Slippage", callback_data="setslippage")],
         [InlineKeyboardButton("Set Preset Targets", callback_data="setpresettargets"), InlineKeyboardButton("Set Preset Stop-Loss", callback_data="setpresetstoploss")],
+        [InlineKeyboardButton("Refresh", callback_data="refresh")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(msg, reply_markup=reply_markup)
@@ -389,18 +486,27 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         token = context.args[0]
         if token in trades:
-            quote = get_swap_quote(token, USDC_MINT, trades[token]["amount"])
-            # --- IMPROVEMENT: Handle direct quote object from v6 API ---
+            info = trades[token]
+            quote = get_swap_quote(token, USDC_MINT, info["amount"])
             if not quote:
                 await update.message.reply_text(f"Could not get a quote to sell {token}")
                 return
             route = quote
-            resp = execute_swap_route(route, USDC_MINT)
+            resp = execute_swap_route(route, USDC_MINT)  # Updated to return only resp
             if resp:
                 out_amount_base = int(route["outAmount"])
                 usdc_decimals = get_token_decimals(USDC_MINT)
                 out_amount_human = out_amount_base / (10 ** usdc_decimals)
-                amount_sold = trades[token]['amount']
+                current_price = fetch_token_price(token)
+                percent_change = ((current_price - info["buy_price"]) / info["buy_price"]) * 100 if current_price else 0
+                usdc_change = (current_price - info["buy_price"]) * info["amount"] if current_price else 0
+                change_str = f"{percent_change:+.2f}% ({usdc_change:+.2f}$)"
+                ticker = info.get("symbol", "UNK")
+                mc = get_market_cap(token, current_price) if current_price else "N/A"
+                sig = resp.value  # Extract signature from resp
+                await app.bot.send_message(chat_id=CHAT_ID, text=f"🔴 Sold {info['amount']} {ticker}\n⚪ Market Cap {mc}\n💲 Amount gotten {out_amount_human}\n📈 Profit/Loss: {change_str}\n🔗 https://solscan.io/tx/{sig}")
+
+                amount_sold = info['amount']
                 trades.pop(token)
                 save_trades(trades)
                 await update.message.reply_text(f"Manually sold {amount_sold} of {token} for {out_amount_human} USDC")
@@ -476,7 +582,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "viewtrades":
         msg = "Tracked Tokens:\n"
         for token, info in trades.items():
-            msg += f"{token}: Buy {info['amount']} tokens at {info['buy_price']}\n"
+            ticker = info.get("symbol", "UNK")
+            mc = get_market_cap(token, info.get("current_price", info["buy_price"]))
+            msg += f"{ticker} ({token})\nAmount: {info['amount']} tokens\nBuy Price: {info['buy_price']} USDC\nMarket Cap: {mc}\n\n"
         await query.message.reply_text(msg or "No trades yet")
     elif query.data == "setwallet":
         await query.message.reply_text("Send /setwallet <128-char-hex-key> to change wallet")
@@ -492,6 +600,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Send /setpresettargets <x1,x2,...> to set preset sell targets")
     elif query.data == "setpresetstoploss":
         await query.message.reply_text("Send /setpresetstoploss <x1,x2,...> to set preset stop-loss")
+    elif query.data == "refresh":
+        msg = generate_status_msg()
+        keyboard = query.message.reply_markup.inline_keyboard
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(text=msg, reply_markup=reply_markup)
 
 app.add_handler(CommandHandler("status", status))
 app.add_handler(CommandHandler("setamount", setamount))
@@ -546,7 +659,7 @@ def run_auto_sell():
 
 if __name__ == "__main__":
     logger.info("Starting bot")
-    required_envs = ["API_ID", "API_HASH", "SESSION_STRING", "BOT_TOKEN", "SOLANA_PRIVATE_KEY"]
+    required_envs = ["API_ID", "API_HASH", "SESSION_STRING", "BOT_TOKEN", "SOLANA_PRIVATE_KEY", "CHAT_ID"]
     for env in required_envs:
         if not os.environ.get(env):
             logger.error(f"Missing required environment variable: {env}")
