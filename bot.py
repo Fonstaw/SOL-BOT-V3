@@ -22,6 +22,9 @@ from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from spl.token.client import Token
 from spl.token.constants import TOKEN_PROGRAM_ID
+from decimal import Decimal, getcontext
+getcontext().prec = 28  # high precision for token math
+MAX_U64 = 2**64 - 1
 
 # Flask app for Web Service
 app_flask = Flask(__name__)
@@ -152,7 +155,7 @@ logger.info("Telethon client initialized")
 # ------------------ JUPITER FUNCTIONS ------------------ #
 
 @retry(stop=stop_after_attempt(MAX_RETRIES), wait=wait_exponential(multiplier=1, min=2, max=10))
-def get_swap_quote(input_mint, output_mint, amount):
+def get_swap_quote(input_mint, output_mint, amount, restrict_intermediates=False, only_direct_routes=False):
     logger.info(f"Getting swap quote: input={input_mint}, output={output_mint}, amount={amount}, slippage={SLIPPAGE_BPS}")
     decimals_in = get_token_decimals(input_mint)
     raw_amount = int(amount * (10 ** decimals_in))
@@ -163,8 +166,10 @@ def get_swap_quote(input_mint, output_mint, amount):
         "outputMint": output_mint,
         "amount": raw_amount,
         "slippageBps": SLIPPAGE_BPS,
-        "onlyDirectRoutes": "false",
+        "onlyDirectRoutes": only_direct_routes,
     }
+    if restrict_intermediates:
+        params["restrictIntermediateTokens"] = True
 
     try:
         r = requests.get(url, params=params)
@@ -177,22 +182,34 @@ def get_swap_quote(input_mint, output_mint, amount):
         logger.error(f"Unexpected error fetching swap quote for {input_mint} to {output_mint}: {e}")
         return None
 
-def execute_swap_route(route, output_mint):
+def execute_swap_route(route, output_mint, *, attempt_reduce_amount=False):
+    """
+    Executes a Jupiter swap given a quote `route`.
+    - Automatically handles signing and sending.
+    - Retries with safer route / smaller amount if Anchor error 6024 (0x1788) occurs.
+    - Keeps wrapAndUnwrapSol=False per your request.
+    """
     try:
         logger.info("Getting swap transaction from Jupiter API")
-        swap_url = f"{JUPITER_API}/swap"
 
+        swap_url = f"{JUPITER_API}/swap"
         swap_payload = {
             "quoteResponse": route,
             "userPublicKey": str(payer.pubkey()),
-            "wrapAndUnwrapSol": False,
+            "wrapAndUnwrapSol": False,             # <-- per your request
             "dynamicComputeUnitLimit": True,
             "prioritizationFeeLamports": 0
         }
 
         swap_resp = requests.post(swap_url, json=swap_payload, timeout=20)
-        swap_resp.raise_for_status()
+        try:
+            swap_resp.raise_for_status()
+        except Exception:
+            logger.error("Jupiter /swap returned failure: %s", swap_resp.text)
+            return None
+
         response_json = swap_resp.json()
+        logger.debug("Swap response JSON: %s", response_json)
 
         tx_base64 = response_json.get("swapTransaction") or response_json.get("swap_transaction")
         if not tx_base64:
@@ -202,34 +219,68 @@ def execute_swap_route(route, output_mint):
         tx_bytes = base64.b64decode(tx_base64)
         raw_tx = VersionedTransaction.from_bytes(tx_bytes)
 
+        # sign
+        to_sign = to_bytes_versioned(raw_tx.message)
         try:
-            to_sign = to_bytes_versioned(raw_tx.message)
             signature = payer.sign_message(to_sign)
             signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
             serialized = bytes(signed_tx)
         except Exception as sign_exc:
-            logger.warning("Primary signing method failed (%s), trying alternate signing paths", sign_exc)
+            logger.warning("Signing failed: %s", sign_exc)
             if hasattr(raw_tx, "create_signatures"):
                 sigs = raw_tx.create_signatures([payer])
                 raw_tx.set_signatures(sigs)
                 serialized = bytes(raw_tx)
             else:
-                try:
-                    resp = sol_client.send_transaction(raw_tx, payer,
-                        opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed"))
-                    logger.info("Sent via send_transaction fallback, resp: %s", resp)
-                    return resp
-                except Exception as e:
-                    logger.error("All signing fallbacks failed: %s", e)
-                    return None
+                logger.exception("All signing fallbacks failed")
+                return None
 
-        opts = TxOpts(skip_preflight=False, preflight_commitment="confirmed")
-        resp = sol_client.send_raw_transaction(serialized, opts=opts)
-        sig = resp.value
-        logger.info("Transaction signature: %s", sig)
-        sol_client.confirm_transaction(sig, commitment="confirmed")
-        logger.info("Transaction confirmed: https://solscan.io/tx/%s", sig)
-        return resp
+        # send transaction
+        try:
+            opts = TxOpts(skip_preflight=False, preflight_commitment="confirmed")
+            resp = sol_client.send_raw_transaction(serialized, opts=opts)
+            sig = resp.value
+            logger.info("Transaction signature: %s", sig)
+            sol_client.confirm_transaction(sig, commitment="confirmed")
+            logger.info("Transaction confirmed: https://solscan.io/tx/%s", sig)
+            return resp
+        except Exception as e:
+            err_text = str(e)
+            logger.error("First send attempt failed: %s", err_text)
+
+            # if 6024/0x1788, retry with safer route
+            if "6024" in err_text or "0x1788" in err_text:
+                logger.warning("Detected custom program error 6024 (0x1788). Trying safer fallbacks: restrict routes / reduce amount.")
+                try:
+                    input_mint = route.get("inputMint") or route.get("inputMint")
+                    output_mint = route.get("outputMint") or output_mint
+                    in_amount_raw = int(route.get("inAmount") or route.get("in_amount") or 0)
+                    decimals = get_token_decimals(input_mint)
+                    human_amount = Decimal(in_amount_raw) / (Decimal(10) ** decimals)
+
+                    # 1) try direct/simpler route
+                    safe_quote = get_swap_quote(
+                        input_mint, output_mint, float(human_amount),
+                        restrict_intermediates=True, only_direct_routes=True
+                    )
+                    if safe_quote:
+                        logger.info("Found safe quote (direct). Retrying swap via /swap with simpler route")
+                        return execute_swap_route(safe_quote, output_mint, attempt_reduce_amount=attempt_reduce_amount)
+
+                    # 2) try selling slightly less (99.9%)
+                    if not attempt_reduce_amount:
+                        reduced_amount = float(human_amount * Decimal('0.999'))
+                        logger.info("Retrying with slightly reduced amount (%s -> %s)", human_amount, reduced_amount)
+                        reduced_quote = get_swap_quote(
+                            input_mint, output_mint, reduced_amount,
+                            restrict_intermediates=True
+                        )
+                        if reduced_quote:
+                            return execute_swap_route(reduced_quote, output_mint, attempt_reduce_amount=True)
+                except Exception as inner_exc:
+                    logger.exception("Fallback attempts failed: %s", inner_exc)
+
+            return None
 
     except requests.exceptions.RequestException as re:
         logger.error("HTTP error talking to Jupiter swap: %s", re)
