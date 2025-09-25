@@ -166,10 +166,10 @@ def get_swap_quote(input_mint, output_mint, amount, restrict_intermediates=False
         "outputMint": output_mint,
         "amount": raw_amount,
         "slippageBps": SLIPPAGE_BPS,
-        "onlyDirectRoutes": only_direct_routes,
+        "onlyDirectRoutes": str(only_direct_routes).lower(),  # Convert boolean to lowercase string
     }
     if restrict_intermediates:
-        params["restrictIntermediateTokens"] = True
+        params["restrictIntermediateTokens"] = str(restrict_intermediates).lower()  # Ensure boolean is string
 
     try:
         r = requests.get(url, params=params)
