@@ -41,6 +41,7 @@ JUPITER_API = os.environ.get("JUPITER_API", "https://quote-api.jup.ag/v6")
 USDC_MINT = os.environ.get("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 CHANNELS = os.environ.get("CHANNELS", "").split(",")
 CHAT_ID = os.environ.get("CHAT_ID")
+FALLBACK_CHAT_ID = os.environ.get("FALLBACK_CHAT_ID")  # Optional fallback chat ID
 
 # Preset auto-sell targets and stop-loss (as percentages) for new tokens
 PRESET_SELL_TARGETS = [2, 3, 5, 10, 20, 50]
@@ -59,6 +60,7 @@ logger = logging.getLogger(__name__)
 
 # ------------------ LOAD/SAVE TRADES ------------------ #
 trades_lock = threading.Lock()
+last_command_chat_id = None  # Store the chat ID from the latest command
 
 def load_trades():
     if os.path.exists(TRADES_FILE):
@@ -278,7 +280,7 @@ def get_status_content():
         [InlineKeyboardButton("Set Targets", callback_data="settargets"), InlineKeyboardButton("Set Stop-Loss", callback_data="setstoploss")],
         [InlineKeyboardButton("Sell Token", callback_data="sell"), InlineKeyboardButton("Set Slippage", callback_data="setslippage")],
         [InlineKeyboardButton("Set Preset Targets", callback_data="setpresettargets"), InlineKeyboardButton("Set Preset Stop-Loss", callback_data="setpresetstoploss")],
-        [InlineKeyboardButton("Refresh Status", callback_data="refreshstatus")],
+        [InlineKeyboardButton("Refresh", callback_data="refreshstatus")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     return msg, reply_markup
@@ -289,6 +291,31 @@ def get_viewtrades_msg():
         name, current_price, _, _, market_cap = get_current_info(token)
         msg += f"Token: {name} ({token})\nAmount: {info['amount']}\nBuy Price: {info['buy_price']}\nCurrent Price: {current_price}\nMarket Cap: {market_cap if isinstance(market_cap, str) else f'{market_cap:.2f}'}\n\n"
     return msg or "No trades yet"
+
+# ------------------ NOTIFICATION FUNCTION ------------------ #
+
+async def send_notification(message, token_mint, action="buy"):
+    global last_command_chat_id
+    chat_ids = []
+    if last_command_chat_id:
+        chat_ids.append(last_command_chat_id)
+    if CHAT_ID and CHAT_ID != last_command_chat_id:
+        chat_ids.append(CHAT_ID)
+    if FALLBACK_CHAT_ID and FALLBACK_CHAT_ID not in chat_ids:
+        chat_ids.append(FALLBACK_CHAT_ID)
+
+    for chat_id in chat_ids:
+        try:
+            await app.bot.send_message(chat_id=int(chat_id), text=message)
+            logger.info(f"Sent {action} notification for {token_mint} to chat {chat_id}")
+            return True  # Stop after first successful send
+        except Exception as e:
+            logger.error(f"Failed to send {action} notification for {token_mint} to chat {chat_id}: {e}. "
+                         f"Ensure the bot is added to the chat with send message permissions. "
+                         f"Use @userinfobot or @getidsbot to verify chat ID. "
+                         f"Current CHAT_ID={CHAT_ID}, BOT_TOKEN starts with {BOT_TOKEN[:10]}...")
+    logger.warning(f"No valid chat IDs for {action} notification of {token_mint}")
+    return False
 
 # ------------------ TRADE LOGIC ------------------ #
 
@@ -332,7 +359,7 @@ async def buy_token(token_mint):
         market_cap = total_supply * buy_price if buy_price and total_supply > 0 else "N/A"
 
         logger.info(f"PRESET_STOP_LOSS: {PRESET_STOP_LOSS}")
-        stop_loss = PRESET_STOP_LOSS[2] if len(PRESET_STOP_LOSS) > 2 else 30  # Default to 30 if index 2 is unavailable
+        stop_loss = PRESET_STOP_LOSS[2] if len(PRESET_STOP_LOSS) > 2 else 30
 
         trades[token_mint] = {
             "buy_price": buy_price,
@@ -350,12 +377,8 @@ async def buy_token(token_mint):
         )
 
         # Send notification
-        try:
-            notif_msg = f"Bought {out_amount_human} {name} ({token_mint}) at {buy_price} USDC each, market cap: {market_cap if isinstance(market_cap, str) else f'{market_cap:.2f}'}"
-            await app.bot.send_message(chat_id=int(CHAT_ID), text=notif_msg)
-            logger.info(f"Sent buy notification for {token_mint} to chat {CHAT_ID}")
-        except Exception as e:
-            logger.error(f"Failed to send buy notification for {token_mint}: {e}")
+        notif_msg = f"Bought {out_amount_human} {name} ({token_mint}) at {buy_price} USDC each, market cap: {market_cap if isinstance(market_cap, str) else f'{market_cap:,.2f}'}"
+        await send_notification(notif_msg, token_mint, action="buy")
 
     except Exception as e:
         logger.error(f"Buy failed for {token_mint}: {str(e)}")
@@ -395,13 +418,8 @@ async def check_auto_sell():
                         logger.info(f"Sold {info['amount']} of {token} for {out_amount_human} USDC at {current_price} (target {target}x)")
 
                         # Send notification
-                        try:
-                            notif_msg = f"Sold {amount} {name} ({token}) for {out_amount_human} USDC (effective price {effective_sell_price}), profit {profit_percent:.2f}% ({profit_usd:.2f} USDC), market cap at sell: {market_cap if isinstance(market_cap, str) else f'{market_cap:.2f}'} (target {target}x)"
-                            await app.bot.send_message(chat_id=int(CHAT_ID), text=notif_msg)
-                            logger.info(f"Sent sell notification for {token} to chat {CHAT_ID}")
-                        except Exception as e:
-                            logger.error(f"Failed to send sell notification for {token}: {e}")
-
+                        notif_msg = f"Sold {amount} {name} ({token}) for {out_amount_human} USDC (effective price {effective_sell_price}), profit {profit_percent:+.2f}% ({profit_usd:+.2f} USDC), market cap at sell: {market_cap if isinstance(market_cap, str) else f'{market_cap:,.2f}'} (target {target}x)"
+                        await send_notification(notif_msg, token, action="sell")
                         to_remove.append(token)
                         break
             
@@ -425,13 +443,8 @@ async def check_auto_sell():
                     logger.info(f"Sold {info['amount']} of {token} for {out_amount_human} USDC at {current_price} (stop-loss {info['stop_loss']}%)")
 
                     # Send notification
-                    try:
-                        notif_msg = f"Sold {amount} {name} ({token}) for {out_amount_human} USDC (effective price {effective_sell_price}), profit {profit_percent:.2f}% ({profit_usd:.2f} USDC), market cap at sell: {market_cap if isinstance(market_cap, str) else f'{market_cap:.2f}'} (stop-loss {info['stop_loss']}%)"
-                        await app.bot.send_message(chat_id=int(CHAT_ID), text=notif_msg)
-                        logger.info(f"Sent sell notification for {token} to chat {CHAT_ID}")
-                    except Exception as e:
-                        logger.error(f"Failed to send sell notification for {token}: {e}")
-
+                    notif_msg = f"Sold {amount} {name} ({token}) for {out_amount_human} USDC (effective price {effective_sell_price}), profit {profit_percent:+.2f}% ({profit_usd:+.2f} USDC), market cap at sell: {market_cap if isinstance(market_cap, str) else f'{market_cap:,.2f}'} (stop-loss {info['stop_loss']}%)"
+                    await send_notification(notif_msg, token, action="sell")
                     to_remove.append(token)
         except Exception as e:
             logger.error(f"Auto-sell error for {token}: {e}")
@@ -446,18 +459,28 @@ async def auto_sell_loop():
         await asyncio.sleep(60)
 
 # ------------------ TELEGRAM COMMANDS ------------------ #
+
+async def update_last_command_chat_id(update: Update):
+    global last_command_chat_id
+    if update.message and update.message.chat_id:
+        last_command_chat_id = str(update.message.chat_id)
+        logger.info(f"Updated last_command_chat_id to {last_command_chat_id}")
+
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received /status command")
+    await update_last_command_chat_id(update)
     msg, reply_markup = get_status_content()
     await update.message.reply_text(msg, reply_markup=reply_markup)
 
 async def viewtrades(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received /viewtrades command")
+    await update_last_command_chat_id(update)
     msg = get_viewtrades_msg()
     await update.message.reply_text(msg)
 
 async def setamount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received /setamount command")
+    await update_last_command_chat_id(update)
     global TRADE_AMOUNT_USDC
     try:
         TRADE_AMOUNT_USDC = float(context.args[0])
@@ -467,6 +490,7 @@ async def setamount(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def settargets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received /settargets command")
+    await update_last_command_chat_id(update)
     try:
         token = context.args[0]
         targets = [float(x) for x in context.args[1].split(",")]
@@ -481,6 +505,7 @@ async def settargets(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setstoploss(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received /setstoploss command")
+    await update_last_command_chat_id(update)
     try:
         token = context.args[0]
         stop = float(context.args[1])
@@ -498,12 +523,14 @@ async def setstoploss(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def togglebuy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received /togglebuy command")
+    await update_last_command_chat_id(update)
     global AUTO_BUY
     AUTO_BUY = not AUTO_BUY
     await update.message.reply_text(f"Auto-buy set to {AUTO_BUY}")
 
 async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received /addchannel command")
+    await update_last_command_chat_id(update)
     try:
         channel = context.args[0].strip()
         if channel not in CHANNELS:
@@ -516,6 +543,7 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received /removechannel command")
+    await update_last_command_chat_id(update)
     try:
         channel = context.args[0].strip()
         if channel in CHANNELS:
@@ -528,6 +556,7 @@ async def removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received /sell command")
+    await update_last_command_chat_id(update)
     try:
         token = context.args[0]
         if token in trades:
@@ -559,12 +588,8 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"Manually sold {amount_sold} of {token} for {out_amount_human} USDC")
 
                 # Send notification
-                try:
-                    notif_msg = f"Manually sold {amount} {name} ({token}) for {out_amount_human} USDC (effective price {effective_sell_price}), profit {profit_percent:.2f}% ({profit_usd:.2f} USDC), market cap at sell: {market_cap if isinstance(market_cap, str) else f'{market_cap:.2f}'}"
-                    await app.bot.send_message(chat_id=int(CHAT_ID), text=notif_msg)
-                    logger.info(f"Sent sell notification for {token} to chat {CHAT_ID}")
-                except Exception as e:
-                    logger.error(f"Failed to send sell notification for {token}: {e}")
+                notif_msg = f"Manually sold {amount} {name} ({token}) for {out_amount_human} USDC (effective price {effective_sell_price}), profit {profit_percent:+.2f}% ({profit_usd:+.2f} USDC), market cap at sell: {market_cap if isinstance(market_cap, str) else f'{market_cap:,.2f}'}"
+                await send_notification(notif_msg, token, action="sell")
             else:
                 await update.message.reply_text(f"Failed to sell {token}: Swap rejected or failed")
         else:
@@ -574,6 +599,7 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received /setwallet command")
+    await update_last_command_chat_id(update)
     global payer
     try:
         new_key = context.args[0]
@@ -584,6 +610,7 @@ async def setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setslippage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received /setslippage command")
+    await update_last_command_chat_id(update)
     global SLIPPAGE_BPS
     try:
         slippage_percent = float(context.args[0])
@@ -597,6 +624,7 @@ async def setslippage(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setpresettargets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received /setpresettargets command")
+    await update_last_command_chat_id(update)
     global PRESET_SELL_TARGETS
     try:
         targets = [float(x) for x in context.args[0].split(",")]
@@ -610,6 +638,7 @@ async def setpresettargets(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setpresetstoploss(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received /setpresetstoploss command")
+    await update_last_command_chat_id(update)
     global PRESET_STOP_LOSS
     try:
         stop_losses = [float(x) for x in context.args[0].split(",")]
@@ -625,6 +654,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     global AUTO_BUY
+    await update_last_command_chat_id(update)
     if query.data == "togglebuy":
         AUTO_BUY = not AUTO_BUY
         await query.message.reply_text(f"Auto-buy set to {AUTO_BUY}")
@@ -691,6 +721,21 @@ async def new_message(event):
                 else:
                     logger.debug(f"Filtered out invalid potential token: {token}")
 
+# ------------------ CHAT_ID VALIDATION ------------------ #
+async def validate_chat_id():
+    chat_ids = [CHAT_ID]
+    if FALLBACK_CHAT_ID and FALLBACK_CHAT_ID != CHAT_ID:
+        chat_ids.append(FALLBACK_CHAT_ID)
+    for chat_id in chat_ids:
+        try:
+            await app.bot.send_message(chat_id=int(chat_id), text="Bot initialized successfully")
+            logger.info(f"Successfully validated chat ID: {chat_id}")
+        except Exception as e:
+            logger.error(f"Failed to validate chat ID {chat_id}: {e}. "
+                         f"Ensure the bot is added to the chat with send message permissions. "
+                         f"Use @userinfobot or @getidsbot to verify chat ID. "
+                         f"Current CHAT_ID={CHAT_ID}, BOT_TOKEN starts with {BOT_TOKEN[:10]}...")
+
 # ------------------ MAIN EXECUTION ------------------ #
 def run_flask():
     app_flask.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
@@ -723,6 +768,10 @@ if __name__ == "__main__":
 
     tele_client.start()
     logger.info("Telethon client started")
+    
+    # Validate chat IDs at startup
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(validate_chat_id())
     
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
